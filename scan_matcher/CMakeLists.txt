@@ -57,7 +57,7 @@ target_compile_definitions(${PROJECT_NAME}_component PRIVATE ${PCL_DEFINITIONS})
 
 # install config
 install(
-  DIRECTORY config
+  DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME}/
 )
 

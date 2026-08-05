@@ -10,6 +10,25 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+// PCL
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/registration/icp.h>
+#include <pcl/registration/ndt.h>
+#include <pcl/registration/gicp.h>
+#include <pcl/common/transforms.h>
+#include <pcl_conversions/pcl_conversions.h>
+
+// ROS 2 TF
+#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
+
 // Iridescence
 #include <glk/indexed_pointcloud_buffer.hpp>
 #include <glk/primitives/primitives.hpp>
@@ -18,62 +37,30 @@
 #include <spdlog/fmt/ostr.h>
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
-// small gicp
-// #include <small_gicp/benchmark/read_points.hpp>
-// #include <small_gicp/pcl/pcl_point.hpp>
-// #include <small_gicp/pcl/pcl_point_traits.hpp>
-// #include <small_gicp/pcl/pcl_registration.hpp>
-// #include <small_gicp/util/downsampling_omp.hpp>
+
 // Eigen
 #include <Eigen/Dense>
+
 // extention node
 #include "extension_node/extension_node.hpp"
+
 // common_utils
 #define USE_ROS2
 #define USE_PCL
 #include "common_utils/common_utils.hpp"
+
 // OpenMP
 #include <omp.h>
 
 #define _ENABLE_ATOMIC_ALIGNMENT_FIX
-//******************************************************************************
+
 // デバック関連設定
 #define N 1000
 #define SCALE 0.01
 
-#define T_X 1.0
-#define T_Y 2.0
-#define T_YAW 1.0
-
 #define PCL_POINT_TYPE pcl::PointXYZ
-//******************************************************************************
 using namespace std::chrono_literals;
-//-- [ToDo] common_utils Update --
-// namespace pcl_utils {
-//   /**
-//    * @brief transform_cloud
-//    *
-//    * @tparam POINT_TYPE
-//    * @param cloud pcl::PointCloud<POINT_TYPE>
-//    * @param x double
-//    * @param y double
-//    * @param z double
-//    * @param roll double
-//    * @param pitch double
-//    * @param yaw double
-//    * @return pcl::PointCloud<POINT_TYPE>
-//    */
-//   template <typename POINT_TYPE = pcl::PointXYZ>
-//   pcl::PointCloud<POINT_TYPE> transform_cloud(const pcl::PointCloud<POINT_TYPE>& cloud, double x, double y, double z, double roll, double pitch,
-//                                               double yaw) {
-//     pcl::PointCloud<POINT_TYPE> output_cloud;
-//     Eigen::Affine3f transformatoin = pcl::getTransformation(x, y, z, roll, pitch, yaw);
-//     pcl::transformPointCloud<POINT_TYPE>(cloud, output_cloud, transformatoin);
-//     return output_cloud;
-//   }
 
-// } // namespace pcl_utils
-//-- [ToDo] common_utils Update --
 namespace simple_slam {
 
   template <typename POINT_TYPE>
@@ -87,51 +74,50 @@ namespace simple_slam {
     return points;
   }
 
-  template <typename POINT_TYPE>
-  std::shared_ptr<glk::PointCloudBuffer> to_cloud_buffer(const pcl::PointCloud<POINT_TYPE>& cloud) {
-    auto cloud_buffer = std::make_shared<glk::PointCloudBuffer>(to_vector_cloud<POINT_TYPE>(cloud));
-    return cloud_buffer;
-  }
   class ScanMatcher : public ext_rclcpp::ExtensionNode {
   public:
     ScanMatcher(const rclcpp::NodeOptions& options) : ScanMatcher("", options) {}
     ScanMatcher(const std::string& name_space = "", const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
         : ext_rclcpp::ExtensionNode("scan_matcher_node", name_space, options), tf_buffer_(this->get_clock()), listener_(tf_buffer_) {
       RCLCPP_INFO(this->get_logger(), "start scan_matcher_node");
+      
       // setup
       SMAP_PUBLISH_RATE = param<double>("scan_matcher.storage_map.publish_rate", 1.0);
-      VOXELGRID_SIZE    = param<double>("scan_matcher.voxel_grid.size", 0.1);
+      VOXELGRID_SIZE    = param<double>("scan_matcher.voxel_grid.size", 0.2);
+      
+      // キーフレーム更新の閾値（0.5m移動、または約8.5度回転でマップ更新）
+      KF_MIN_TRANS      = param<double>("scan_matcher.keyframe.min_trans", 0.5);
+      KF_MIN_ROT        = param<double>("scan_matcher.keyframe.min_rot", 0.15);
+      
       kill_switch_      = false;
-      // logger
-      // const int ringbuffer_size = 100;
-      // ringbuffer_sink_          = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(ringbuffer_size);
+      scan_matcher_type_ = static_cast<ScanMatcherType>(param<int>("scan_matcher.type", 0));
+      
       logger_ = spdlog::get("scan_matcher_logger");
-      // logger_->set_level(spdlog::level::trace);
-      // logger_->sinks().emplace_back(ringbuffer_sink_);
-      // init
+      
+      // TF Broadcaster
+      tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+
       // publisher
       out_cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("scan_matcher/out_points", rclcpp::QoS(10));
+      map_pub_       = this->create_publisher<sensor_msgs::msg::PointCloud2>("scan_matcher/local_map", rclcpp::QoS(1), rclcpp::PublisherOptions());
+
       // subscriber
-      cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>("in_points", rclcpp::QoS(10),
-                                                                            [&](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {});
-      timer_     = this->create_wall_timer(1s * SMAP_PUBLISH_RATE, [&]() {
-        // Eigen::Isometry3d T_target_source = scan_matching(target_cloud_.makeShared(), source_cloud_.makeShared()); 
+      cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+        "in_points", rclcpp::QoS(10),
+        std::bind(&ScanMatcher::cloud_callback, this, std::placeholders::_1));
+        
+      timer_ = this->create_wall_timer(1s * SMAP_PUBLISH_RATE, [&]() {
+        // 定期的なマップパブリッシュ等
+        if(!local_map_->empty()) {
+            sensor_msgs::msg::PointCloud2 map_msg;
+            pcl::toROSMsg(*local_map_, map_msg);
+            map_msg.header.frame_id = "map";
+            map_msg.header.stamp = this->now();
+            map_pub_->publish(map_msg);
+        }
       });
-      // for (int i = 0; i < N; i++) {
-      //   PCL_POINT_TYPE p;
-      //   if (i < N / 2) {
-      //     p.x = 0.0;
-      //     p.y = i * SCALE;
-      //     p.z = 0.0;
-      //   } else {
-      //     p.x = i * SCALE;
-      //     p.y = 0.0;
-      //     p.z = 0.0;
-      //   }
-      //   source_cloud_.push_back(p);
-      // }
-      // thread_ = std::thread([this] { viewer_loop(); });
     }
+
     ~ScanMatcher() {
       kill_switch_ = true;
       if (thread_.joinable()) {
@@ -142,117 +128,203 @@ namespace simple_slam {
   private:
     double SMAP_PUBLISH_RATE;
     double VOXELGRID_SIZE;
+    double KF_MIN_TRANS;
+    double KF_MIN_ROT;
     bool kill_switch_;
+    enum class ScanMatcherType { ICP, NDT, GICP, GICP_OMP, SMALL_GICP } scan_matcher_type_;
 
-    // viewer
-    std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> ringbuffer_sink_;
-    // Logging
     std::shared_ptr<spdlog::logger> logger_;
-    // test
-    float t_x   = T_X;
-    float t_y   = T_Y;
-    float t_yaw = T_YAW;
-    pcl::PointCloud<PCL_POINT_TYPE> source_cloud_;
-    pcl::PointCloud<PCL_POINT_TYPE> target_cloud_;
-    // tf
+
+    // Poses
+    Eigen::Matrix4d current_pose_ = Eigen::Matrix4d::Identity();
+    Eigen::Matrix4d previous_pose_ = Eigen::Matrix4d::Identity();
+    Eigen::Matrix4d last_keyframe_pose_ = Eigen::Matrix4d::Identity();
+
+    // PointClouds
+    typename pcl::PointCloud<PCL_POINT_TYPE>::Ptr local_map_{new pcl::PointCloud<PCL_POINT_TYPE>};
+
+    // TF & ROS
     tf2_ros::Buffer tf_buffer_;
     tf2_ros::TransformListener listener_;
-    // timer
+    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    
     rclcpp::TimerBase::SharedPtr timer_;
-    // subscriber
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
-    // publisher
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr out_cloud_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
 
     std::mutex mtx_;
     std::thread thread_;
 
-    void viewer_loop() {
-      auto viewer                         = guik::LightViewer::instance();
-      guik::ShaderSetting& global_setting = viewer->shader_setting();
-      global_setting.set_point_scale_screenspace(); // Set the point scale mode to screenspace
-      global_setting.set_point_size(5.0f);          // Set the base point size to 5.0
-      while (viewer->spin_once()) {
-        // // Register a callback for UI rendering
-        // viewer->register_ui_callback("ui", [&]() {
-        //   // In the callback, you can call ImGui commands to create your UI.
-        //   // Here, we use "DragFloat" and "Button" to create a simple UI.
-        //   ImGui::DragFloat("T_X", &t_x, 0.01f);
-        //   ImGui::DragFloat("T_Y", &t_y, 0.01f);
-        //   ImGui::DragFloat("T_Yaw", &t_yaw, 0.01f);
+    void cloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+      typename pcl::PointCloud<PCL_POINT_TYPE>::Ptr current_cloud(new pcl::PointCloud<PCL_POINT_TYPE>);
+      pcl::fromROSMsg(*msg, *current_cloud);
 
-        //   if (ImGui::Button("Close")) {
-        //     viewer->close();
-        //   }
-        // });
-        // std::lock_guard<std::mutex> lock(mtx_);
-        // target_cloud_ = pcl_utils::transform_cloud<PCL_POINT_TYPE>(source_cloud_, t_x, t_y, 0.0, 0.0, 0.0, t_yaw);
+      // 1. ダウンサンプリング
+      typename pcl::PointCloud<PCL_POINT_TYPE>::Ptr downsampled_cloud(new pcl::PointCloud<PCL_POINT_TYPE>);
+      pcl::VoxelGrid<PCL_POINT_TYPE> voxel_filter;
+      voxel_filter.setLeafSize(VOXELGRID_SIZE, VOXELGRID_SIZE, VOXELGRID_SIZE);
+      voxel_filter.setInputCloud(current_cloud);
+      voxel_filter.filter(*downsampled_cloud);
 
-        // icp.setInputSource(source_cloud);
-        // icp.setInputTarget(target_cloud);
-        // auto [aligned_cloud, score, converged, final_transformation] = icp.transform(source_cloud, target_cloud);
+      std::lock_guard<std::mutex> lock(mtx_);
 
-        // if (converged) {
-        //   spdlog::info("ICP has converged.");
-        //   spdlog::info("Fitness score: {:.2f}", score);
-        //   spdlog::info("Final transformation:\n{}", final_transformation);
-        //   Eigen::Vector3d translation = final_transformation.block<3, 1>(0, 3);
-        //   Eigen::Matrix3d rotation    = final_transformation.block<3, 3>(0, 0);
-        //   Eigen::Vector3d euler       = rotation.eulerAngles(0, 1, 2);
-        //   spdlog::info("Translation: {} \nRPY:{}", translation.transpose());
-        //   spdlog::info("RPY:{}", euler.transpose());
-        // } else {
-        //   spdlog::warn("ICP did not converge.");
-        // }
-
-        viewer->update_drawable("source_points", to_cloud_buffer<PCL_POINT_TYPE>(source_cloud_), guik::FlatRed());
-        viewer->update_drawable("target_points", to_cloud_buffer<PCL_POINT_TYPE>(target_cloud_), guik::FlatGreen());
-        // viewer->update_drawable("aligned_points", to_cloud_buffer<PCL_POINT_TYPE>(aligned_cloud), guik::FlatBlue());
-
-        // viewer->register_ui_callback("logging", guik::create_logger_ui(glim::get_ringbuffer_sink(), 0.5));
+      // 初回フレームの処理
+      if (local_map_->empty()) {
+        *local_map_ = *downsampled_cloud;
+        current_pose_ = Eigen::Matrix4d::Identity();
+        previous_pose_ = Eigen::Matrix4d::Identity();
+        last_keyframe_pose_ = Eigen::Matrix4d::Identity();
+        RCLCPP_INFO(this->get_logger(), "Initialized local map with first frame.");
+        publish_tf(msg->header.stamp, current_pose_);
+        return;
       }
-      guik::LightViewer::destroy();
+
+      // 2. 等速直線運動モデルによる初期位置（Initial Guess）の予測
+      Eigen::Matrix4d velocity = previous_pose_.inverse() * current_pose_;
+      Eigen::Matrix4d initial_guess = current_pose_ * velocity;
+
+      // 3. スキャンマッチングの実行 (Target: local_map_, Source: current_cloud)
+      auto result = scan_matching<PCL_POINT_TYPE>(local_map_, downsampled_cloud, initial_guess);
+      
+      if (result.has_value()) {
+        auto [score, tmat, aligned_cloud] = result.value();
+        
+        // 姿勢の更新
+        previous_pose_ = current_pose_;
+        current_pose_ = tmat; // マップ座標系における現在の位置・姿勢
+
+        // 4. TFの配信
+        publish_tf(msg->header.stamp, current_pose_);
+
+        // 5. アラインメントされた点群のパブリッシュ
+        sensor_msgs::msg::PointCloud2 out_msg;
+        pcl::toROSMsg(aligned_cloud, out_msg);
+        out_msg.header.frame_id = "map"; // マップ座標系に変換済み
+        out_msg.header.stamp = msg->header.stamp;
+        out_cloud_pub_->publish(out_msg);
+
+        // 6. キーフレーム（マップ）の更新判定
+        Eigen::Matrix4d delta_pose = last_keyframe_pose_.inverse() * current_pose_;
+        double delta_trans = delta_pose.block<3, 1>(0, 3).norm();
+        double delta_rot = Eigen::AngleAxisd(delta_pose.block<3, 3>(0, 0)).angle();
+
+        if (delta_trans > KF_MIN_TRANS || delta_rot > KF_MIN_ROT) {
+          *local_map_ += aligned_cloud;
+          
+          // マップが肥大化しないようにVoxelGridをかける
+          typename pcl::PointCloud<PCL_POINT_TYPE>::Ptr filtered_map(new pcl::PointCloud<PCL_POINT_TYPE>);
+          voxel_filter.setInputCloud(local_map_);
+          voxel_filter.filter(*filtered_map);
+          local_map_ = filtered_map;
+
+          last_keyframe_pose_ = current_pose_;
+          // RCLCPP_INFO(this->get_logger(), "Keyframe added. Map size: %zu", local_map_->size());
+        }
+      }
     }
 
-    std::optional<std::tuple<double, Eigen::Matrix4d, pcl::PointCloud<pcl::PointNormal>>> scan_matching(const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& raw_target, const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& raw_sourc){
+    void publish_tf(const rclcpp::Time& stamp, const Eigen::Matrix4d& pose) {
+      geometry_msgs::msg::TransformStamped t;
+      t.header.stamp = stamp;
+      t.header.frame_id = "map";
+      t.child_frame_id = "base_link";
 
+      t.transform.translation.x = pose(0, 3);
+      t.transform.translation.y = pose(1, 3);
+      t.transform.translation.z = pose(2, 3);
+
+      Eigen::Matrix3d R = pose.block<3, 3>(0, 0);
+      Eigen::Quaterniond q(R);
+      t.transform.rotation.x = q.x();
+      t.transform.rotation.y = q.y();
+      t.transform.rotation.z = q.z();
+      t.transform.rotation.w = q.w();
+
+      tf_broadcaster_->sendTransform(t);
     }
 
-    // Eigen::Isometry3d scan_matching(const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& raw_target, const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& raw_source) {
-    //   // using namespace small_gicp;
-    //   // Downsample points and convert them into pcl::PointCloud<pcl::PointCovariance>.
-    //   pcl::PointCloud<pcl::PointCovariance>::Ptr target =
-    //       voxelgrid_sampling_omp<pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(*raw_target, 0.25);
-    //   pcl::PointCloud<pcl::PointCovariance>::Ptr source =
-    //       voxelgrid_sampling_omp<pcl::PointCloud<pcl::PointXYZ>, pcl::PointCloud<pcl::PointCovariance>>(*raw_source, 0.25);
+    template <typename POINT_TYPE = pcl::PointXYZ>
+    std::optional<std::tuple<double, Eigen::Matrix4d, pcl::PointCloud<POINT_TYPE>>> scan_matching(
+      const typename pcl::PointCloud<POINT_TYPE>::ConstPtr& target,
+      const typename pcl::PointCloud<POINT_TYPE>::ConstPtr& source,
+      const Eigen::Matrix4d& initial_guess) {
 
-    //   // Estimate covariances of points.
-    //   const int num_threads   = 4;
-    //   const int num_neighbors = 20;
-    //   estimate_covariances_omp(*target, num_neighbors, num_threads);
-    //   estimate_covariances_omp(*source, num_neighbors, num_threads);
+      if (target->empty() || source->empty()) {
+        return std::nullopt;
+      }
 
-    //   // Create KdTree for target and source.
-    //   auto target_tree = std::make_shared<KdTree<pcl::PointCloud<pcl::PointCovariance>>>(target, KdTreeBuilderOMP(num_threads));
-    //   auto source_tree = std::make_shared<KdTree<pcl::PointCloud<pcl::PointCovariance>>>(source, KdTreeBuilderOMP(num_threads));
+      pcl::PointCloud<POINT_TYPE> aligned_cloud;
+      double fitness_score = 0.0;
+      Eigen::Matrix4d transformation = Eigen::Matrix4d::Identity();
+      Eigen::Matrix4f guess_f = initial_guess.cast<float>();
 
-    //   Registration<GICPFactor, ParallelReductionOMP> registration;
-    //   registration.reduction.num_threads = num_threads;
-    //   registration.rejector.max_dist_sq  = 1.0;
+      switch (scan_matcher_type_) {
+        case ScanMatcherType::ICP: {
+          pcl::IterativeClosestPoint<POINT_TYPE, POINT_TYPE> icp;
+          icp.setInputTarget(target);
+          icp.setInputSource(source);
+          icp.setMaximumIterations(50);
+          icp.setTransformationEpsilon(1e-6);
+          icp.setMaxCorrespondenceDistance(1.0);
+          
+          icp.align(aligned_cloud, guess_f);
 
-    //   // Align point clouds. Note that the input point clouds are pcl::PointCloud<pcl::PointCovariance>.
-    //   auto result = registration.align(*target, *source, *target_tree, Eigen::Isometry3d::Identity());
-    //   Eigen::Isometry3d T_target_source = result.T_target_source.matrix();
-    //   std::cout << "--- T_target_source ---" << std::endl << T_target_source << std::endl;
-    //   std::cout << "converged:" << result.converged << std::endl;
-    //   std::cout << "error:" << result.error << std::endl;
-    //   std::cout << "iterations:" << result.iterations << std::endl;
-    //   std::cout << "num_inliers:" << result.num_inliers << std::endl;
-    //   std::cout << "--- H ---" << std::endl << result.H << std::endl;
-    //   std::cout << "--- b ---" << std::endl << result.b.transpose() << std::endl;
-    //   return T_target_source;
-    // }
+          if (icp.hasConverged()) {
+            fitness_score = icp.getFitnessScore();
+            transformation = icp.getFinalTransformation().template cast<double>();
+            return std::make_tuple(fitness_score, transformation, aligned_cloud);
+          }
+          break;
+        }
+
+        case ScanMatcherType::NDT: {
+          pcl::NormalDistributionsTransform<POINT_TYPE, POINT_TYPE> ndt;
+          ndt.setInputTarget(target);
+          ndt.setInputSource(source);
+          ndt.setResolution(1.0);
+          ndt.setMaximumIterations(35);
+          ndt.setTransformationEpsilon(0.01);
+          ndt.setStepSize(0.1);
+          
+          ndt.align(aligned_cloud, guess_f);
+
+          if (ndt.hasConverged()) {
+            fitness_score = ndt.getFitnessScore();
+            transformation = ndt.getFinalTransformation().template cast<double>();
+            return std::make_tuple(fitness_score, transformation, aligned_cloud);
+          }
+          break;
+        }
+
+        case ScanMatcherType::GICP: {
+          pcl::GeneralizedIterativeClosestPoint<POINT_TYPE, POINT_TYPE> gicp;
+          gicp.setInputTarget(target);
+          gicp.setInputSource(source);
+          gicp.setMaximumIterations(50);
+          gicp.setTransformationEpsilon(1e-6);
+          gicp.setMaxCorrespondenceDistance(1.0);
+          
+          gicp.align(aligned_cloud, guess_f);
+
+          if (gicp.hasConverged()) {
+            fitness_score = gicp.getFitnessScore();
+            transformation = gicp.getFinalTransformation().template cast<double>();
+            return std::make_tuple(fitness_score, transformation, aligned_cloud);
+          }
+          break;
+        }
+
+        case ScanMatcherType::GICP_OMP:
+        case ScanMatcherType::SMALL_GICP:
+          RCLCPP_WARN(this->get_logger(), "External GICP not implemented. Use standard GICP.");
+          break;
+      }
+
+      return std::nullopt;
+    }
   };
 } // namespace simple_slam
+
 #include <rclcpp_components/register_node_macro.hpp>
 RCLCPP_COMPONENTS_REGISTER_NODE(simple_slam::ScanMatcher)
