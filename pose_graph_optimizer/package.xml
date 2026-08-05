@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>scan_matcher</name>
+  <name>pose_graph_optimizer</name>
   <version>0.0.0</version>
-  <description>Match laser scans to a map</description>
+  <description>Optimize pose graphs for SLAM</description>
   <maintainer email="eieioeiji0501@gmail.com">f11</maintainer>
   <license>Apache License 2.0</license>
 
