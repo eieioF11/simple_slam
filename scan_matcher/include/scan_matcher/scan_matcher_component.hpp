@@ -86,11 +86,10 @@ namespace simple_slam {
       SMAP_PUBLISH_RATE = param<double>("scan_matcher.storage_map.publish_rate", 1.0);
       VOXELGRID_SIZE    = param<double>("scan_matcher.voxel_grid.size", 0.2);
 
-      // キーフレーム更新の閾値（0.5m移動、または約8.5度回転でマップ更新）
-      KF_MIN_TRANS = param<double>("scan_matcher.keyframe.min_trans", 0.5);
+      // キーフレーム更新の閾値
+      KF_MIN_TRANS = param<double>("scan_matcher.keyframe.min_trans", 0.1);
       KF_MIN_ROT   = param<double>("scan_matcher.keyframe.min_rot", 0.15);
 
-      kill_switch_       = false;
       scan_matcher_type_ = static_cast<ScanMatcherType>(param<int>("scan_matcher.type", 0));
 
       logger_ = spdlog::get("scan_matcher_logger");
@@ -101,8 +100,6 @@ namespace simple_slam {
       // publisher
       out_cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("scan_matcher/out_points", rclcpp::QoS(10));
       map_pub_       = this->create_publisher<sensor_msgs::msg::PointCloud2>("scan_matcher/local_map", rclcpp::QoS(1), rclcpp::PublisherOptions());
-
-      // ★追加: Pose Graph Optimizer にキーフレームのPoseを送るためのパブリッシャー
       keyframe_odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("scan_matcher/keyframe_odom", rclcpp::QoS(10));
 
       // subscriber
@@ -110,7 +107,6 @@ namespace simple_slam {
                                                                             std::bind(&ScanMatcher::cloud_callback, this, std::placeholders::_1));
 
       timer_ = this->create_wall_timer(1s * SMAP_PUBLISH_RATE, [&]() {
-        // 定期的なマップパブリッシュ等
         if (!local_map_->empty()) {
           sensor_msgs::msg::PointCloud2 map_msg;
           pcl::toROSMsg(*local_map_, map_msg);
@@ -121,19 +117,11 @@ namespace simple_slam {
       });
     }
 
-    ~ScanMatcher() {
-      kill_switch_ = true;
-      if (thread_.joinable()) {
-        thread_.join();
-      }
-    }
-
   private:
     double SMAP_PUBLISH_RATE;
     double VOXELGRID_SIZE;
     double KF_MIN_TRANS;
     double KF_MIN_ROT;
-    bool kill_switch_;
     enum class ScanMatcherType { ICP, NDT, GICP, GICP_OMP, SMALL_GICP } scan_matcher_type_;
 
     std::shared_ptr<spdlog::logger> logger_;
@@ -155,12 +143,7 @@ namespace simple_slam {
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr out_cloud_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
-
-    // ★追加: パブリッシャー変数
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr keyframe_odom_pub_;
-
-    std::mutex mtx_;
-    std::thread thread_;
 
     void cloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
       typename pcl::PointCloud<PCL_POINT_TYPE>::Ptr current_cloud(new pcl::PointCloud<PCL_POINT_TYPE>);
@@ -172,8 +155,6 @@ namespace simple_slam {
       voxel_filter.setLeafSize(VOXELGRID_SIZE, VOXELGRID_SIZE, VOXELGRID_SIZE);
       voxel_filter.setInputCloud(current_cloud);
       voxel_filter.filter(*downsampled_cloud);
-
-      std::lock_guard<std::mutex> lock(mtx_);
 
       // 初回フレームの処理
       if (local_map_->empty()) {
@@ -227,7 +208,7 @@ namespace simple_slam {
 
           last_keyframe_pose_ = current_pose_;
 
-          // ★追加: 新しいキーフレームが追加されたので、バックエンドにPoseを通知
+          // 新しいキーフレームが追加されたので、バックエンドにPoseを通知
           publish_keyframe_odom(msg->header.stamp, current_pose_);
         }
       }
@@ -253,7 +234,6 @@ namespace simple_slam {
       tf_broadcaster_->sendTransform(t);
     }
 
-    // ★追加: Pose Graph Optimizer向けのオドメトリパブリッシュ関数
     void publish_keyframe_odom(const rclcpp::Time& stamp, const Eigen::Matrix4d& pose) {
       nav_msgs::msg::Odometry odom_msg;
       odom_msg.header.stamp    = stamp;

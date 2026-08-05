@@ -5,6 +5,9 @@
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+// extention node
+#include "extension_node/extension_node.hpp"
+
 // GTSAM
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/geometry/Rot3.h>
@@ -19,9 +22,9 @@
 
 namespace simple_slam {
 
-  class PoseGraphOptimizer : public rclcpp::Node {
+  class PoseGraphOptimizer : public ext_rclcpp::ExtensionNode {
   public:
-    PoseGraphOptimizer(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("pose_graph_optimizer", options) {
+    PoseGraphOptimizer(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : ext_rclcpp::ExtensionNode("pose_graph_optimizer", options) {
 
       RCLCPP_INFO(this->get_logger(), "Starting GTSAM Pose Graph Optimizer (ISAM2)...");
 
