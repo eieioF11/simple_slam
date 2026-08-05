@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(simple_slam)
+project(scan_matcher)
 
 add_compile_options(-O3)
 
@@ -39,11 +39,11 @@ ament_auto_add_library(${PROJECT_NAME}_component SHARED
 target_include_directories(${PROJECT_NAME}_component PRIVATE
   include
   ${PCL_INCLUDE_DIRS}
-  ${small_gicp_INCLUDE_DIRS}
+  # ${small_gicp_INCLUDE_DIRS}
 )
 
 rclcpp_components_register_node(${PROJECT_NAME}_component
-  PLUGIN      "simple_slam::SimpleSlam"
+  PLUGIN      "simple_slam::ScanMatcher"
   EXECUTABLE  ${PROJECT_NAME}
 )
 target_link_libraries(${PROJECT_NAME}_component
@@ -51,7 +51,7 @@ target_link_libraries(${PROJECT_NAME}_component
   Iridescence::Iridescence
   spdlog::spdlog_header_only
   ${PCL_LIBRARIES}
-  small_gicp::small_gicp
+  # small_gicp::small_gicp
 )
 target_compile_definitions(${PROJECT_NAME}_component PRIVATE ${PCL_DEFINITIONS})
 
