@@ -22,3 +22,19 @@
       stop_velocity:
         trans: 0.01 # [double] 停止状態とみなす並進速度の閾値 [m/s]
         rot: 0.008 # [double] 停止状態とみなす回転速度の閾値 [rad/s]
+
+      icp:
+        max_iterations: 50 # [int] ICPの最大反復回数
+        transformation_epsilon: 1.0e-6 # [double] ICPの変換収束条件
+        max_correspondence_distance: 1.0 # [double] ICPの最大対応点距離
+
+      ndt:
+        resolution: 1.0 # [double] NDTのボクセルグリッド解像度 [m]
+        max_iterations: 35 # [int] NDTの最大反復回数
+        transformation_epsilon: 0.01 # [double] NDTの変換収束条件
+        step_size: 0.1 # [double] NDTのステップサイズ
+
+      gicp:
+        max_iterations: 50 # [int] GICPの最大反復回数
+        transformation_epsilon: 1.0e-6 # [double] GICPの変換収束条件
+        max_correspondence_distance: 1.0 # [double] GICPの最大対応点距離

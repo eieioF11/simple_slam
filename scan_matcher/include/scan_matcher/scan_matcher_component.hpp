@@ -97,6 +97,17 @@ namespace simple_slam {
       STOP_VELOCITY_TRANS = param<double>("scan_matcher.stop_velocity.trans", 0.01);
       STOP_VELOCITY_ROT   = param<double>("scan_matcher.stop_velocity.rot", 0.008);
 
+      ICP_MAX_ITERATIONS               = param<int>("scan_matcher.icp.max_iterations", 50);
+      ICP_TRANSFORMATION_EPSILON       = param<double>("scan_matcher.icp.transformation_epsilon", 1e-6);
+      ICP_MAX_CORRESPONDENCE_DISTANCE  = param<double>("scan_matcher.icp.max_correspondence_distance", 1.0);
+      NDT_RESOLUTION                   = param<double>("scan_matcher.ndt.resolution", 1.0);
+      NDT_MAX_ITERATIONS               = param<int>("scan_matcher.ndt.max_iterations", 35);
+      NDT_TRANSFORMATION_EPSILON       = param<double>("scan_matcher.ndt.transformation_epsilon", 0.01);
+      NDT_STEP_SIZE                    = param<double>("scan_matcher.ndt.step_size", 0.1);
+      GICP_MAX_ITERATIONS              = param<int>("scan_matcher.gicp.max_iterations", 50);
+      GICP_TRANSFORMATION_EPSILON      = param<double>("scan_matcher.gicp.transformation_epsilon", 1e-6);
+      GICP_MAX_CORRESPONDENCE_DISTANCE = param<double>("scan_matcher.gicp.max_correspondence_distance", 1.0);
+
       scan_matcher_type_ = static_cast<ScanMatcherType>(param<int>("scan_matcher.type", 0));
 
       logger_                                                                = spdlog::get("scan_matcher_logger");
@@ -148,6 +159,18 @@ namespace simple_slam {
     double STOP_VELOCITY_TRANS;
     double STOP_VELOCITY_ROT;
     size_t LOCAL_MAP_WINDOW_SIZE;
+    // Scan Matcher Parameters
+    int ICP_MAX_ITERATIONS = 50;
+    double ICP_TRANSFORMATION_EPSILON = 1e-6;
+    double ICP_MAX_CORRESPONDENCE_DISTANCE = 1.0;
+    double NDT_RESOLUTION = 1.0;
+    int NDT_MAX_ITERATIONS = 35;
+    double NDT_TRANSFORMATION_EPSILON = 0.01;
+    double NDT_STEP_SIZE = 0.1;
+    int GICP_MAX_ITERATIONS = 50;
+    double GICP_TRANSFORMATION_EPSILON = 1e-6;
+    double GICP_MAX_CORRESPONDENCE_DISTANCE = 1.0;
+
     enum class ScanMatcherType { ICP, NDT, GICP, GICP_OMP, SMALL_GICP } scan_matcher_type_;
 
     std::shared_ptr<spdlog::logger> logger_;
@@ -331,9 +354,9 @@ namespace simple_slam {
           pcl::IterativeClosestPoint<POINT_TYPE, POINT_TYPE> icp;
           icp.setInputTarget(target);
           icp.setInputSource(source);
-          icp.setMaximumIterations(50);
-          icp.setTransformationEpsilon(1e-6);
-          icp.setMaxCorrespondenceDistance(1.0);
+          icp.setMaximumIterations(ICP_MAX_ITERATIONS);
+          icp.setTransformationEpsilon(ICP_TRANSFORMATION_EPSILON);
+          icp.setMaxCorrespondenceDistance(ICP_MAX_CORRESPONDENCE_DISTANCE);
 
           icp.align(aligned_cloud, guess_f);
 
@@ -344,15 +367,14 @@ namespace simple_slam {
           }
           break;
         }
-
         case ScanMatcherType::NDT: {
           pcl::NormalDistributionsTransform<POINT_TYPE, POINT_TYPE> ndt;
           ndt.setInputTarget(target);
           ndt.setInputSource(source);
-          ndt.setResolution(1.0);
-          ndt.setMaximumIterations(35);
-          ndt.setTransformationEpsilon(0.01);
-          ndt.setStepSize(0.1);
+          ndt.setResolution(NDT_RESOLUTION);
+          ndt.setMaximumIterations(NDT_MAX_ITERATIONS);
+          ndt.setTransformationEpsilon(NDT_TRANSFORMATION_EPSILON);
+          ndt.setStepSize(NDT_STEP_SIZE);
 
           ndt.align(aligned_cloud, guess_f);
 
@@ -368,9 +390,9 @@ namespace simple_slam {
           pcl::GeneralizedIterativeClosestPoint<POINT_TYPE, POINT_TYPE> gicp;
           gicp.setInputTarget(target);
           gicp.setInputSource(source);
-          gicp.setMaximumIterations(50);
-          gicp.setTransformationEpsilon(1e-6);
-          gicp.setMaxCorrespondenceDistance(1.0);
+          gicp.setMaximumIterations(GICP_MAX_ITERATIONS);
+          gicp.setTransformationEpsilon(GICP_TRANSFORMATION_EPSILON);
+          gicp.setMaxCorrespondenceDistance(GICP_MAX_CORRESPONDENCE_DISTANCE);
 
           gicp.align(aligned_cloud, guess_f);
 

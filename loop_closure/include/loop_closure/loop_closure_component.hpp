@@ -107,7 +107,7 @@ namespace simple_slam {
       kf.cloud = downsampled_cloud;
       keyframes_.push_back(kf);
 
-      // 2. ループ探索 (過去のキーフレームとの距離を比較)
+      // ループ探索 (過去のキーフレームとの距離を比較)
       if (keyframes_.size() < skip_recent_frames_ + 1) {
         return; // 履歴が少ない場合はスキップ
       }
@@ -128,7 +128,7 @@ namespace simple_slam {
         }
       }
 
-      // 3. ループ候補が見つかった場合、ICPマッチングで検証
+      // ループ候補が見つかった場合、ICPマッチングで検証
       if (loop_candidate_id != -1) {
         verifyLoopClosure(loop_candidate_id, kf, odom_msg->header.stamp);
       }

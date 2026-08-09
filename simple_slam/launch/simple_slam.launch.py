@@ -69,7 +69,8 @@ def generate_launch_description():
                 parameters=[scan_matcher_param],
                 remappings=[
                     ('in_points', '/velodyne_points')
-                ]
+                ],
+                extra_arguments=[{"use_intra_process_comms": True}],
             ),
             #Pose Graph Optimizer
             ComposableNode(
@@ -83,21 +84,23 @@ def generate_launch_description():
                 package='map_builder',
                 plugin='simple_slam::MapBuilder',
                 name='map_builder',
-                parameters=[map_builder_param]
+                parameters=[map_builder_param],
+                extra_arguments=[{"use_intra_process_comms": True}],
             ),
             #Loop Closure
             ComposableNode(
                 package='loop_closure',
                 plugin='simple_slam::LoopClosure',
                 name='loop_closure',
-                parameters=[loop_closure_param]
+                parameters=[loop_closure_param],
+                extra_arguments=[{"use_intra_process_comms": True}],
             ),
             #Iridescence Viewer
             ComposableNode(
                 package='simple_slam',
                 plugin='simple_slam::IridescenceViewer',
                 name='iridescence_viewer',
-                # parameters=[loop_closure_param]
+                extra_arguments=[{"use_intra_process_comms": True}],
             ),
         ],
         output='screen',
