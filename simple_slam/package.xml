@@ -5,7 +5,7 @@
   <version>0.0.0</version>
   <description>Match laser scans to a map</description>
   <maintainer email="eieioeiji0501@gmail.com">f11</maintainer>
-  <license>Apache License 2.0</license>
+  <license>MIT</license>
 
   <buildtool_depend>ament_cmake_auto</buildtool_depend>
 
