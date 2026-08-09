@@ -1,0 +1,7 @@
+/**:
+  ros__parameters:
+    map_builder:
+      global_voxel_size: 0.2 # [double] グローバルマップのボクセルサイズ [m]
+      grid_resolution: 0.1 # [double] 2Dグリッドマップの解像度 [m/cell]
+      z_min_filter: 0.1 # [double] 床面を除去するためのZ下限 [m]
+      z_max_filter: 1.5 # [double] 天井を除去するためのZ上限 [m]

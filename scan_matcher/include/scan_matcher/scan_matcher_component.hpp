@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <deque>
 #include <execution>
 #include <iostream>
 #include <laser_geometry/laser_geometry.hpp>
@@ -79,20 +80,40 @@ namespace simple_slam {
   public:
     ScanMatcher(const rclcpp::NodeOptions& options) : ScanMatcher("", options) {}
     ScanMatcher(const std::string& name_space = "", const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
-        : ext_rclcpp::ExtensionNode("scan_matcher_node", name_space, options), tf_buffer_(this->get_clock()), listener_(tf_buffer_) {
-      RCLCPP_INFO(this->get_logger(), "start scan_matcher_node");
+        : ext_rclcpp::ExtensionNode("scan_matcher", name_space, options), tf_buffer_(this->get_clock()), listener_(tf_buffer_) {
+      RCLCPP_INFO(this->get_logger(), "Starting Scan Matcher Node...");
 
       // setup
       SMAP_PUBLISH_RATE = param<double>("scan_matcher.storage_map.publish_rate", 1.0);
       VOXELGRID_SIZE    = param<double>("scan_matcher.voxel_grid.size", 0.2);
-
+      RADIUS_OUTLIER_REMOVAL_RADIUS = param<double>("scan_matcher.radius_outlier_removal.radius", 0.5);
+      RADIUS_OUTLIER_REMOVAL_MIN_NEIGHBORS = param<int>("scan_matcher.radius_outlier_removal.min_neighbors", 2);
       // キーフレーム更新の閾値
-      KF_MIN_TRANS = param<double>("scan_matcher.keyframe.min_trans", 0.1);
-      KF_MIN_ROT   = param<double>("scan_matcher.keyframe.min_rot", 0.15);
+      KF_MIN_TRANS = param<double>("scan_matcher.keyframe.min_trans", 0.5);
+      KF_MIN_ROT   = param<double>("scan_matcher.keyframe.min_rot", 0.3);
+
+      LOCAL_MAP_WINDOW_SIZE = param<int>("scan_matcher.local_map.window_size", 10);
+
+      STOP_VELOCITY_TRANS = param<double>("scan_matcher.stop_velocity.trans", 0.01);
+      STOP_VELOCITY_ROT   = param<double>("scan_matcher.stop_velocity.rot", 0.008);
 
       scan_matcher_type_ = static_cast<ScanMatcherType>(param<int>("scan_matcher.type", 0));
 
-      logger_ = spdlog::get("scan_matcher_logger");
+      logger_                                                                = spdlog::get("scan_matcher_logger");
+      std::unordered_map<ScanMatcherType, std::string> scan_matcher_type_map = {{ScanMatcherType::ICP, "ICP"},
+                                                                                {ScanMatcherType::NDT, "NDT"},
+                                                                                {ScanMatcherType::GICP, "GICP"},
+                                                                                {ScanMatcherType::GICP_OMP, "GICP_OMP"},
+                                                                                {ScanMatcherType::SMALL_GICP, "SMALL_GICP"}};
+      if (scan_matcher_type_map.find(scan_matcher_type_) == scan_matcher_type_map.end()) {
+        spdlog::error("Invalid scan matcher type: {}", static_cast<int>(scan_matcher_type_));
+        throw std::runtime_error("Invalid scan matcher type");
+      }
+      spdlog::info("Scan Matcher Type = {}", scan_matcher_type_map[scan_matcher_type_]);
+      spdlog::info("Scan Matcher Node initialized with parameters: "
+                   "\nSMAP_PUBLISH_RATE={}\nVOXELGRID_SIZE={}\nKF_MIN_TRANS={}\nKF_MIN_ROT={}\nLOCAL_MAP_WINDOW_SIZE={}\nSTOP_VELOCITY_TRANS={}"
+                   "\nSTOP_VELOCITY_ROT={}",
+                   SMAP_PUBLISH_RATE, VOXELGRID_SIZE, KF_MIN_TRANS, KF_MIN_ROT, LOCAL_MAP_WINDOW_SIZE, STOP_VELOCITY_TRANS, STOP_VELOCITY_ROT);
 
       // TF Broadcaster
       tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -105,8 +126,8 @@ namespace simple_slam {
       // subscriber
       cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>("in_points", rclcpp::QoS(10),
                                                                             std::bind(&ScanMatcher::cloud_callback, this, std::placeholders::_1));
-
-      timer_ = this->create_wall_timer(1s * SMAP_PUBLISH_RATE, [&]() {
+      double smap_publish_rate = 1.0 / SMAP_PUBLISH_RATE;
+      timer_ = this->create_wall_timer(1s * smap_publish_rate, [&]() {
         if (!local_map_->empty()) {
           sensor_msgs::msg::PointCloud2 map_msg;
           pcl::toROSMsg(*local_map_, map_msg);
@@ -120,11 +141,18 @@ namespace simple_slam {
   private:
     double SMAP_PUBLISH_RATE;
     double VOXELGRID_SIZE;
+    double RADIUS_OUTLIER_REMOVAL_RADIUS;
+    int RADIUS_OUTLIER_REMOVAL_MIN_NEIGHBORS;
     double KF_MIN_TRANS;
     double KF_MIN_ROT;
+    double STOP_VELOCITY_TRANS;
+    double STOP_VELOCITY_ROT;
+    size_t LOCAL_MAP_WINDOW_SIZE;
     enum class ScanMatcherType { ICP, NDT, GICP, GICP_OMP, SMALL_GICP } scan_matcher_type_;
 
     std::shared_ptr<spdlog::logger> logger_;
+
+    std::deque<typename pcl::PointCloud<PCL_POINT_TYPE>::Ptr> recent_keyframes_;
 
     // Poses
     Eigen::Matrix4d current_pose_       = Eigen::Matrix4d::Identity();
@@ -149,12 +177,19 @@ namespace simple_slam {
       typename pcl::PointCloud<PCL_POINT_TYPE>::Ptr current_cloud(new pcl::PointCloud<PCL_POINT_TYPE>);
       pcl::fromROSMsg(*msg, *current_cloud);
 
-      // 1. ダウンサンプリング
+      // ダウンサンプリング
       typename pcl::PointCloud<PCL_POINT_TYPE>::Ptr downsampled_cloud(new pcl::PointCloud<PCL_POINT_TYPE>);
       pcl::VoxelGrid<PCL_POINT_TYPE> voxel_filter;
       voxel_filter.setLeafSize(VOXELGRID_SIZE, VOXELGRID_SIZE, VOXELGRID_SIZE);
       voxel_filter.setInputCloud(current_cloud);
       voxel_filter.filter(*downsampled_cloud);
+
+      // 外れ値除去
+      pcl::RadiusOutlierRemoval<PCL_POINT_TYPE> radius_outlier_removal;
+      radius_outlier_removal.setInputCloud(downsampled_cloud);
+      radius_outlier_removal.setRadiusSearch(RADIUS_OUTLIER_REMOVAL_RADIUS);
+      radius_outlier_removal.setMinNeighborsInRadius(RADIUS_OUTLIER_REMOVAL_MIN_NEIGHBORS);
+      radius_outlier_removal.filter(*downsampled_cloud);
 
       // 初回フレームの処理
       if (local_map_->empty()) {
@@ -162,44 +197,66 @@ namespace simple_slam {
         current_pose_       = Eigen::Matrix4d::Identity();
         previous_pose_      = Eigen::Matrix4d::Identity();
         last_keyframe_pose_ = Eigen::Matrix4d::Identity();
+        // spdlog::info("Initialized local map with first frame.");
         RCLCPP_INFO(this->get_logger(), "Initialized local map with first frame.");
         publish_tf(msg->header.stamp, current_pose_);
-        publish_keyframe_odom(msg->header.stamp, current_pose_); // ★追加: 初回もキーフレームとして送信
+        sensor_msgs::msg::PointCloud2 out_msg;
+        pcl::toROSMsg(*downsampled_cloud, out_msg);
+        out_msg.header.frame_id = "map";
+        out_msg.header.stamp    = msg->header.stamp;
+        out_cloud_pub_->publish(out_msg);
+        publish_keyframe_odom(msg->header.stamp, current_pose_);
         return;
       }
 
-      // 2. 等速直線運動モデルによる初期位置（Initial Guess）の予測
-      Eigen::Matrix4d velocity      = previous_pose_.inverse() * current_pose_;
+      // 等速直線運動モデルによる初期位置（Initial Guess）の予測
+      Eigen::Matrix4d velocity = previous_pose_.inverse() * current_pose_;
+      // 移動量と回転量を計算
+      double v_trans = velocity.block<3, 1>(0, 3).norm();
+      double v_rot   = Eigen::AngleAxisd(velocity.block<3, 3>(0, 0)).angle();
+      if (v_trans < STOP_VELOCITY_TRANS && v_rot < STOP_VELOCITY_ROT) {
+        velocity = Eigen::Matrix4d::Identity();
+      }
+      RCLCPP_DEBUG(this->get_logger(), "Velocity: trans=%f, rot=%f", v_trans, v_rot);
+
       Eigen::Matrix4d initial_guess = current_pose_ * velocity;
 
-      // 3. スキャンマッチングの実行 (Target: local_map_, Source: current_cloud)
+      // スキャンマッチングの実行 (Target: local_map_, Source: current_cloud)
       auto result = scan_matching<PCL_POINT_TYPE>(local_map_, downsampled_cloud, initial_guess);
-
       if (result.has_value()) {
         auto [score, tmat, aligned_cloud] = result.value();
+        RCLCPP_DEBUG(this->get_logger(), "Scan matching successful. Fitness score: %f", score);
 
         // 姿勢の更新
         previous_pose_ = current_pose_;
         current_pose_  = tmat; // マップ座標系における現在の位置・姿勢
 
-        // 4. TFの配信
+        // TFの配信
         publish_tf(msg->header.stamp, current_pose_);
 
-        // 5. アラインメントされた点群のパブリッシュ
+        // アラインメントされた点群のパブリッシュ
         sensor_msgs::msg::PointCloud2 out_msg;
         pcl::toROSMsg(aligned_cloud, out_msg);
         out_msg.header.frame_id = "map"; // マップ座標系に変換済み
         out_msg.header.stamp    = msg->header.stamp;
         out_cloud_pub_->publish(out_msg);
-
-        // 6. キーフレーム（マップ）の更新判定
+        // キーフレームの更新判定
         Eigen::Matrix4d delta_pose = last_keyframe_pose_.inverse() * current_pose_;
         double delta_trans         = delta_pose.block<3, 1>(0, 3).norm();
         double delta_rot           = Eigen::AngleAxisd(delta_pose.block<3, 3>(0, 0)).angle();
 
         if (delta_trans > KF_MIN_TRANS || delta_rot > KF_MIN_ROT) {
-          *local_map_ += aligned_cloud;
-
+          typename pcl::PointCloud<PCL_POINT_TYPE>::Ptr cloud_ptr(new pcl::PointCloud<PCL_POINT_TYPE>(aligned_cloud));
+          recent_keyframes_.push_back(cloud_ptr);
+          // 古いキーフレームを削除
+          if (recent_keyframes_.size() > LOCAL_MAP_WINDOW_SIZE) {
+            recent_keyframes_.pop_front();
+          }
+          // ローカルマップ作成
+          local_map_->clear();
+          for (const auto& kf_cloud : recent_keyframes_) {
+            *local_map_ += *kf_cloud;
+          }
           // マップが肥大化しないようにVoxelGridをかける
           typename pcl::PointCloud<PCL_POINT_TYPE>::Ptr filtered_map(new pcl::PointCloud<PCL_POINT_TYPE>);
           voxel_filter.setInputCloud(local_map_);
@@ -207,10 +264,12 @@ namespace simple_slam {
           local_map_ = filtered_map;
 
           last_keyframe_pose_ = current_pose_;
-
-          // 新しいキーフレームが追加されたので、バックエンドにPoseを通知
+          // バックエンドにPoseを通知（実装済みの場合）
           publish_keyframe_odom(msg->header.stamp, current_pose_);
         }
+      } else {
+        RCLCPP_WARN(this->get_logger(), "Scan matching failed. Using previous pose as current pose.");
+        current_pose_ = previous_pose_;
       }
     }
 
@@ -326,6 +385,7 @@ namespace simple_slam {
 
         case ScanMatcherType::GICP_OMP:
         case ScanMatcherType::SMALL_GICP:
+          spdlog::warn("External GICP not implemented. Use standard GICP.");
           RCLCPP_WARN(this->get_logger(), "External GICP not implemented. Use standard GICP.");
           break;
       }

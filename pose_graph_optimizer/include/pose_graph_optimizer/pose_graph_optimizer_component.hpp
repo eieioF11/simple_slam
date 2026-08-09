@@ -17,6 +17,15 @@
 #include <gtsam/slam/BetweenFactor.h>
 #include <gtsam/slam/PriorFactor.h>
 
+// Iridescence
+#include <glk/indexed_pointcloud_buffer.hpp>
+#include <glk/primitives/primitives.hpp>
+#include <guik/spdlog_sink.hpp>
+#include <guik/viewer/light_viewer.hpp>
+#include <spdlog/fmt/ostr.h>
+#include <spdlog/sinks/ringbuffer_sink.h>
+#include <spdlog/spdlog.h>
+
 #include <mutex>
 #include <vector>
 
@@ -27,12 +36,17 @@ namespace simple_slam {
     PoseGraphOptimizer(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : ext_rclcpp::ExtensionNode("pose_graph_optimizer", options) {
 
       RCLCPP_INFO(this->get_logger(), "Starting GTSAM Pose Graph Optimizer (ISAM2)...");
+      logger_ = spdlog::get("pose_graph_optimizer_logger");
 
       // ISAM2のパラメータ設定
       gtsam::ISAM2Params parameters;
-      parameters.relinearizeThreshold = 0.1;
-      parameters.relinearizeSkip      = 1;
-      isam2_                          = std::make_unique<gtsam::ISAM2>(parameters);
+      parameters.relinearizeThreshold = param<double>("pose_graph_optimizer.isam2.relinearizeThreshold", 0.1);
+      parameters.relinearizeSkip      = param<int>("pose_graph_optimizer.isam2.relinearizeSkip", 1);
+      ISAM2_UPDATE_NUM                = param<int>("pose_graph_optimizer.isam2.update_num", 3);
+      // parameters.relinearizeThreshold = 0.1;
+      // parameters.relinearizeSkip      = 1;
+      isam2_ = std::make_unique<gtsam::ISAM2>(parameters);
+      // spdlog::info("ISAM2 parameters: \nrelinearizeThreshold={}\nrelinearizeSkip={}", parameters.relinearizeThreshold, parameters.relinearizeSkip);
 
       // ノイズモデル（共分散）の定義
       // 実際にはスキャンマッチングのFitness Score等から動的に設定するのが理想です
@@ -55,10 +69,12 @@ namespace simple_slam {
 
   private:
     // GTSAM Graph & ISAM2
+    int ISAM2_UPDATE_NUM;
     std::unique_ptr<gtsam::ISAM2> isam2_;
     gtsam::NonlinearFactorGraph gtSAMgraph_;
     gtsam::Values initialEstimate_;
     gtsam::Values currentEstimate_;
+    std::shared_ptr<spdlog::logger> logger_;
 
     // 状態管理
     std::mutex mtx_;
@@ -104,7 +120,8 @@ namespace simple_slam {
 
       // ISAM2で最適化を実行
       isam2_->update(gtSAMgraph_, initialEstimate_);
-      isam2_->update(); // 数回呼ぶと収束が良くなる場合があります
+      for (int i = 0; i < ISAM2_UPDATE_NUM; ++i)
+        isam2_->update();
 
       // グラフと初期推定値をクリア（ISAM2の内部に保持されるため）
       gtSAMgraph_.resize(0);
@@ -133,13 +150,13 @@ namespace simple_slam {
       // 過去のノードと現在のノードを繋ぐ BetweenFactor を追加
       gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(loop_target_id, current_id, loop_relative_pose, loop_noise_));
 
+      // spdlog::info("Loop Closure Added: {} -> {}", current_id, loop_target_id);
       RCLCPP_INFO(this->get_logger(), "Loop Closure Added: %d -> %d", current_id, loop_target_id);
 
       // ループを閉じた際はグラフ全体が大きく動くため、ISAM2を更新
       isam2_->update(gtSAMgraph_, initialEstimate_);
-      isam2_->update();
-      isam2_->update();
-      isam2_->update(); // 収束させるために複数回回す
+      for (int i = 0; i < ISAM2_UPDATE_NUM; ++i)
+        isam2_->update();
 
       gtSAMgraph_.resize(0);
       initialEstimate_.clear();

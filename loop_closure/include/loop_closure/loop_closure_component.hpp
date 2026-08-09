@@ -42,17 +42,18 @@ namespace simple_slam {
 
       RCLCPP_INFO(this->get_logger(), "Starting Loop Closure Node...");
 
-      search_radius_        = param<double>("search_radius", 3.0);
-      skip_recent_frames_   = param<int>("skip_recent_frames", 50);
-      fitness_score_thresh_ = param<double>("fitness_score_thresh", 0.3);
-      voxel_size_           = param<double>("voxel_size", 0.3);
+      search_radius_        = param<double>("loop_closure.search_radius", 3.0);
+      skip_recent_frames_   = param<int>("loop_closure.skip_recent_frames", 50);
+      fitness_score_thresh_ = param<double>("loop_closure.fitness_score_thresh", 0.3);
+      voxel_size_           = param<double>("loop_closure.voxel_size", 0.3);
 
       // Publisher (Pose Graph Optimizer へ送信する制約)
       loop_constraint_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("loop_closure/constraint", rclcpp::QoS(10));
 
       // Subscribers (OdometryとPointCloud2を同期して受信)
       odom_sub_.subscribe(this, "scan_matcher/keyframe_odom");
-      cloud_sub_.subscribe(this, "scan_matcher/out_points");
+      cloud_sub_.subscribe(this, "scan_matcher/local_map");
+      // cloud_sub_.subscribe(this, "scan_matcher/out_points");
 
       sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(SyncPolicy(10), odom_sub_, cloud_sub_);
       sync_->registerCallback(std::bind(&LoopClosure::syncCallback, this, std::placeholders::_1, std::placeholders::_2));
