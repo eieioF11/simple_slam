@@ -131,7 +131,7 @@ namespace simple_slam {
         opt_pose(2, 3)             = p.position.z;
 
         // 元の点群はScanMatcherのローカルマップ基準（keyframe_raw_poses_[i]）で登録されているため、
-        // 「元のPoseの逆行列」を掛けてローカル座標に戻してから、「最適化Pose」を掛けて新しい位置に配置する。
+        // 元のPoseの逆行列を掛けてローカル座標に戻してから、「最適化Pose」を掛けて新しい位置に配置する。
         Eigen::Matrix4d correction_transform = opt_pose * keyframe_raw_poses_[i].inverse();
 
         pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_cloud(new pcl::PointCloud<pcl::PointXYZ>);

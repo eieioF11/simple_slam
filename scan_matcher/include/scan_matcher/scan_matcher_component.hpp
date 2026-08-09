@@ -244,7 +244,6 @@ namespace simple_slam {
         Eigen::Matrix4d delta_pose = last_keyframe_pose_.inverse() * current_pose_;
         double delta_trans         = delta_pose.block<3, 1>(0, 3).norm();
         double delta_rot           = Eigen::AngleAxisd(delta_pose.block<3, 3>(0, 0)).angle();
-
         if (delta_trans > KF_MIN_TRANS || delta_rot > KF_MIN_ROT) {
           typename pcl::PointCloud<PCL_POINT_TYPE>::Ptr cloud_ptr(new pcl::PointCloud<PCL_POINT_TYPE>(aligned_cloud));
           recent_keyframes_.push_back(cloud_ptr);
