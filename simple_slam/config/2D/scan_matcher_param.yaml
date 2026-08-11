@@ -1,27 +1,29 @@
 /**:
   ros__parameters:
     scan_matcher:
+      map_frame_id: "map" # [string] マップ座標系のフレームID
+      base_frame_id: "base_link" # [string] ベース座標系のフレームID
       type: 2 # [int] 0: ICP, 1: NDT, 2: GICP
       storage_map:
         publish_rate: 10.0 # [double] マップのPublishレート [Hz]
 
       voxel_grid:
-        size: 0.1 # [double] ボクセルグリッドフィルタのサイズ [m]
+        size: 0.05 # [double] ボクセルグリッドフィルタのサイズ [m]
 
       radius_outlier_removal:
-        radius: 0.5 # [double] 外れ値除去の半径 [m]
+        radius: 0.15 # [double] 外れ値除去の半径 [m]
         min_neighbors: 2 # [int] 外れ値とみなす最小近傍数
 
       keyframe:
-        min_trans: 0.5 # [double] キーフレームを更新する最小並進移動量 [m]
-        min_rot: 0.3 # [double] キーフレームを更新する最小回転移動量 [rad]
+        min_trans: 0.2 # [double] キーフレームを更新する最小並進移動量 [m]
+        min_rot: 0.1 # [double] キーフレームを更新する最小回転移動量 [rad]
 
       local_map:
-        window_size: 10 # [int] ローカルマップを構築するためのウィンドウサイズ（フレーム数）
+        window_size: 4 # [int] ローカルマップを構築するためのウィンドウサイズ（フレーム数）
 
       stop_velocity:
-        trans: 0.01 # [double] 停止状態とみなす並進速度の閾値 [m/s]
-        rot: 0.008 # [double] 停止状態とみなす回転速度の閾値 [rad/s]
+        trans: 0.1 # [double] 停止状態とみなす並進速度の閾値 [m/s]
+        rot: 0.01 # [double] 停止状態とみなす回転速度の閾値 [rad/s]
 
       icp:
         max_iterations: 50 # [int] ICPの最大反復回数
@@ -35,6 +37,6 @@
         step_size: 0.1 # [double] NDTのステップサイズ
 
       gicp:
-        max_iterations: 50 # [int] GICPの最大反復回数
+        max_iterations: 100 # [int] GICPの最大反復回数
         transformation_epsilon: 1.0e-6 # [double] GICPの変換収束条件
-        max_correspondence_distance: 1.0 # [double] GICPの最大対応点距離
+        max_correspondence_distance: 0.7 # [double] GICPの最大対応点距離

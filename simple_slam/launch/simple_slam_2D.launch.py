@@ -10,7 +10,7 @@ def generate_launch_description():
         pkg_share_dir,
         # get_package_share_directory('scan_matcher'),
         'config',
-        '3D',
+        '2D',
         'scan_matcher_param.yaml'
     )
 
@@ -18,7 +18,7 @@ def generate_launch_description():
         pkg_share_dir,
         # get_package_share_directory('pose_graph_optimizer'),
         'config',
-        '3D',
+        '2D',
         'pose_graph_optimizer_param.yaml'
     )
 
@@ -26,7 +26,7 @@ def generate_launch_description():
         pkg_share_dir,
         # get_package_share_directory('map_builder'),
         'config',
-        '3D',
+        '2D',
         'map_builder_param.yaml'
     )
 
@@ -34,7 +34,7 @@ def generate_launch_description():
         pkg_share_dir,
         # get_package_share_directory('loop_closure'),
         'config',
-        '3D',
+        '2D',
         'loop_closure_param.yaml'
     )
 
@@ -53,8 +53,7 @@ def generate_launch_description():
                 name='scan_matcher',
                 parameters=[scan_matcher_param],
                 remappings=[
-                    ('in_points', '/velodyne_points'),
-                    # ('in_scan', '/scan'),
+                    ('in_scan', '/scan'),
                 ],
                 extra_arguments=[{"use_intra_process_comms": True}],
             ),

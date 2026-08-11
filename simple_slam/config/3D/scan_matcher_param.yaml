@@ -5,10 +5,10 @@
       base_frame_id: "base_link" # [string] ベース座標系のフレームID
       type: 2 # [int] 0: ICP, 1: NDT, 2: GICP
       storage_map:
-        publish_rate: 1.0 # [double] マップのPublishレート [Hz]
+        publish_rate: 10.0 # [double] マップのPublishレート [Hz]
 
       voxel_grid:
-        size: 0.2 # [double] ボクセルグリッドフィルタのサイズ [m]
+        size: 0.1 # [double] ボクセルグリッドフィルタのサイズ [m]
 
       radius_outlier_removal:
         radius: 0.5 # [double] 外れ値除去の半径 [m]
