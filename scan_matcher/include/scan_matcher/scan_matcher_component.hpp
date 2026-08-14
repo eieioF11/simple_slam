@@ -58,7 +58,7 @@
 #define _ENABLE_ATOMIC_ALIGNMENT_FIX
 
 #define PCL_POINT_TYPE pcl::PointXYZ
-#define FAKE_3D_POINT_Z 0.5
+#define FAKE_3D_POINT_Z 0.1
 
 using namespace std::chrono_literals;
 
