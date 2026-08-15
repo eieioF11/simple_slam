@@ -40,3 +40,10 @@
         max_iterations: 50 # [int] GICPの最大反復回数
         transformation_epsilon: 1.0e-6 # [double] GICPの変換収束条件
         max_correspondence_distance: 1.0 # [double] GICPの最大対応点距離
+
+      sgicp:
+        num_threads: 4 # [int] SGICPのスレッド数
+        correspondence_randomness: 20 # [int] SGICPの対応点ランダム性
+        max_correspondence_distance: 1.0 # [double] SGICPの最大対応点距離
+        voxel_resolution: 1.0 # [double] SGICPのボクセル解像度 [m]
+        registration_type: "VGICP" # [string] SGICPの登録タイプ ("VGICP" or "GICP")

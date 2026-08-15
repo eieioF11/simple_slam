@@ -22,6 +22,9 @@
 #include <pcl/registration/ndt.h>
 #include <pcl_conversions/pcl_conversions.h>
 
+// small GICP
+#include <small_gicp/pcl/pcl_registration.hpp>
+
 // ROS 2 TF & Msgs
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -108,6 +111,12 @@ namespace simple_slam {
       GICP_MAX_ITERATIONS              = param<int>("scan_matcher.gicp.max_iterations", 50);
       GICP_TRANSFORMATION_EPSILON      = param<double>("scan_matcher.gicp.transformation_epsilon", 1e-6);
       GICP_MAX_CORRESPONDENCE_DISTANCE = param<double>("scan_matcher.gicp.max_correspondence_distance", 1.0);
+      SGICP_NUM_THREADS = param<int>("scan_matcher.sgicp.num_threads", 4);
+      SGICP_CORRESPONDENCE_RANDOMNESS = param<int>("scan_matcher.sgicp.correspondence_randomness", 20);
+      SGICP_MAX_CORRESPONDENCE_DISTANCE = param<double>("scan_matcher.sgicp.max_correspondence_distance", 1.0);
+      SGICP_VOXEL_RESOLUTION = param<double>("scan_matcher.sgicp.voxel_resolution", 1.0);
+      SGICP_REGISTRATION_TYPE = param<std::string>("scan_matcher.sgicp.registration_type", "VGICP");
+
       // Scan Matcher Type
       scan_matcher_type_ = static_cast<ScanMatcherType>(param<int>("scan_matcher.type", 0));
       // Logger
@@ -115,7 +124,6 @@ namespace simple_slam {
       std::unordered_map<ScanMatcherType, std::string> scan_matcher_type_map = {{ScanMatcherType::ICP, "ICP"},
                                                                                 {ScanMatcherType::NDT, "NDT"},
                                                                                 {ScanMatcherType::GICP, "GICP"},
-                                                                                {ScanMatcherType::GICP_OMP, "GICP_OMP"},
                                                                                 {ScanMatcherType::SMALL_GICP, "SMALL_GICP"}};
       if (scan_matcher_type_map.find(scan_matcher_type_) == scan_matcher_type_map.end()) {
         spdlog::error("Invalid scan matcher type: {}", static_cast<int>(scan_matcher_type_));
@@ -169,10 +177,16 @@ namespace simple_slam {
     int GICP_MAX_ITERATIONS;
     double GICP_TRANSFORMATION_EPSILON;
     double GICP_MAX_CORRESPONDENCE_DISTANCE;
+    int SGICP_NUM_THREADS;
+    int SGICP_CORRESPONDENCE_RANDOMNESS;
+    double SGICP_MAX_CORRESPONDENCE_DISTANCE;
+    double SGICP_VOXEL_RESOLUTION;
+    std::string SGICP_REGISTRATION_TYPE;
+
     std::string map_frame_id_;
     std::string base_frame_id_;
 
-    enum class ScanMatcherType { ICP, NDT, GICP, GICP_OMP, SMALL_GICP } scan_matcher_type_;
+    enum class ScanMatcherType { ICP, NDT, GICP, SMALL_GICP } scan_matcher_type_;
 
     std::shared_ptr<spdlog::logger> logger_;
 
@@ -457,12 +471,24 @@ namespace simple_slam {
           }
           break;
         }
+        case ScanMatcherType::SMALL_GICP: {
+          small_gicp::RegistrationPCL<POINT_TYPE, POINT_TYPE> reg;
+          reg.setInputTarget(target);
+          reg.setInputSource(source);
+          reg.setNumThreads(SGICP_NUM_THREADS);
+          reg.setCorrespondenceRandomness(SGICP_CORRESPONDENCE_RANDOMNESS);
+          reg.setMaxCorrespondenceDistance(SGICP_MAX_CORRESPONDENCE_DISTANCE);
+          reg.setVoxelResolution(SGICP_VOXEL_RESOLUTION);
+          reg.setRegistrationType(SGICP_REGISTRATION_TYPE);
 
-        case ScanMatcherType::GICP_OMP:
-        case ScanMatcherType::SMALL_GICP:
-          spdlog::warn("External GICP not implemented. Use standard GICP.");
-          RCLCPP_WARN(this->get_logger(), "External GICP not implemented. Use standard GICP.");
-          break;
+          reg.align(aligned_cloud, guess_f);
+          if (reg.hasConverged()) {
+            fitness_score  = reg.getFitnessScore();
+            transformation = reg.getFinalTransformation().template cast<double>();
+            return std::make_tuple(fitness_score, transformation, aligned_cloud);
+          }
+        }
+        break;
       }
 
       return std::nullopt;
