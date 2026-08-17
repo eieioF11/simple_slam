@@ -5,3 +5,10 @@
       skip_recent_frames: 20 # [int] ループ判定から除外する直近のフレーム数（誤検知防止）
       fitness_score_thresh: 0.3 # [double] ループを確定するフィットネススコアの閾値（小さいほどマッチング精度が高い）
       voxel_size: 0.01 # [double] マッチング処理前のダウンサンプリング用ボクセルサイズ [m]
+      gicp:
+        max_iterations: 50 # [int] GICPの最大反復回数
+      sgicp: #※ small_gicpのSGICPを使う場合
+        num_threads: 4 # [int] SGICPのスレッド数
+        correspondence_randomness: 20 # [int] SGICPの対応点ランダム性
+        voxel_resolution: 1.0 # [double] SGICPのボクセル解像度 [m]
+        registration_type: "VGICP" # [string] SGICPの登録タイプ ("VGICP" or "GICP")

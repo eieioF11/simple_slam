@@ -20,6 +20,10 @@
 #include <pcl/registration/icp.h>
 #include <pcl_conversions/pcl_conversions.h>
 
+// small GICP
+#define USE_SMALL_GICP
+#include <small_gicp/pcl/pcl_registration.hpp>
+
 // Eigen
 #include <Eigen/Dense>
 
@@ -47,6 +51,12 @@ namespace simple_slam {
       fitness_score_thresh_ = param<double>("loop_closure.fitness_score_thresh", 0.3);
       voxel_size_           = param<double>("loop_closure.voxel_size", 0.3);
 
+      GICP_MAX_ITERATIONS             = param<int>("loop_closure.gicp.max_iterations", 50);
+      SGICP_NUM_THREADS               = param<int>("loop_closure.sgicp.num_threads", 4);
+      SGICP_CORRESPONDENCE_RANDOMNESS = param<int>("loop_closure.sgicp.correspondence_randomness", 20);
+      SGICP_VOXEL_RESOLUTION          = param<double>("loop_closure.sgicp.voxel_resolution", 1.0);
+      SGICP_REGISTRATION_TYPE         = param<std::string>("loop_closure.sgicp.registration_type", "VGICP");
+
       // Publisher (Pose Graph Optimizer へ送信する制約)
       loop_constraint_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("loop_closure/constraint", rclcpp::QoS(10));
 
@@ -64,6 +74,12 @@ namespace simple_slam {
     int skip_recent_frames_;
     double fitness_score_thresh_;
     double voxel_size_;
+
+    int GICP_MAX_ITERATIONS;
+    int SGICP_NUM_THREADS;
+    int SGICP_CORRESPONDENCE_RANDOMNESS;
+    double SGICP_VOXEL_RESOLUTION;
+    std::string SGICP_REGISTRATION_TYPE;
 
     std::vector<KeyFrame> keyframes_;
     std::mutex mtx_;
@@ -138,13 +154,25 @@ namespace simple_slam {
 
       pcl::PointCloud<pcl::PointXYZ>::Ptr target_cloud = keyframes_[target_id].cloud;
       pcl::PointCloud<pcl::PointXYZ>::Ptr source_cloud = current_kf.cloud;
-
+#ifdef USE_SMALL_GICP
+      // SGICPによる位置合わせ
+      small_gicp::RegistrationPCL<pcl::PointXYZ, pcl::PointXYZ> gicp;
+      gicp.setInputTarget(target_cloud);
+      gicp.setInputSource(source_cloud);
+      gicp.setMaximumIterations(GICP_MAX_ITERATIONS);
+      gicp.setNumThreads(SGICP_NUM_THREADS);
+      gicp.setCorrespondenceRandomness(SGICP_CORRESPONDENCE_RANDOMNESS);
+      gicp.setMaxCorrespondenceDistance(search_radius_ * 2.0);
+      gicp.setVoxelResolution(SGICP_VOXEL_RESOLUTION);
+      gicp.setRegistrationType(SGICP_REGISTRATION_TYPE);
+#else
       // GICPによる位置合わせ
       pcl::GeneralizedIterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> gicp;
       gicp.setInputTarget(target_cloud);
       gicp.setInputSource(source_cloud);
-      gicp.setMaximumIterations(50);
+      gicp.setMaximumIterations(GICP_MAX_ITERATIONS);
       gicp.setMaxCorrespondenceDistance(search_radius_ * 2.0);
+#endif
 
       // ICPの初期値（Initial Guess）として、オドメトリ上の相対ポーズを与える
       Eigen::Matrix4d initial_guess = keyframes_[target_id].pose.inverse() * current_kf.pose;

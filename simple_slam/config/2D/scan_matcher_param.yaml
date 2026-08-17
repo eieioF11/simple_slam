@@ -3,7 +3,7 @@
     scan_matcher:
       map_frame_id: "map" # [string] マップ座標系のフレームID
       base_frame_id: "base_link" # [string] ベース座標系のフレームID
-      type: 2 # [int] 0: ICP, 1: NDT, 2: GICP
+      type: 3 # [int] 0: ICP, 1: NDT, 2: GICP, 3: SGICP
       storage_map:
         publish_rate: 10.0 # [double] マップのPublishレート [Hz]
 

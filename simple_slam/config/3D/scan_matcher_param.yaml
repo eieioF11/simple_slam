@@ -3,7 +3,7 @@
     scan_matcher:
       map_frame_id: "map" # [string] マップ座標系のフレームID
       base_frame_id: "base_link" # [string] ベース座標系のフレームID
-      type: 2 # [int] 0: ICP, 1: NDT, 2: GICP
+      type: 3 # [int] 0: ICP, 1: NDT, 2: GICP, 3: SGICP
       storage_map:
         publish_rate: 10.0 # [double] マップのPublishレート [Hz]
 
@@ -42,8 +42,9 @@
         max_correspondence_distance: 1.0 # [double] GICPの最大対応点距離
 
       sgicp:
-        num_threads: 4 # [int] SGICPのスレッド数
+        max_iterations: 50 # [int] SGICPの最大反復回数
+        num_threads: 12 # [int] SGICPのスレッド数
         correspondence_randomness: 20 # [int] SGICPの対応点ランダム性
         max_correspondence_distance: 1.0 # [double] SGICPの最大対応点距離
         voxel_resolution: 1.0 # [double] SGICPのボクセル解像度 [m]
-        registration_type: "VGICP" # [string] SGICPの登録タイプ ("VGICP" or "GICP")
+        registration_type: "GICP" # [string] SGICPの登録タイプ ("VGICP" or "GICP")

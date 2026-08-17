@@ -112,6 +112,7 @@ namespace simple_slam {
       GICP_TRANSFORMATION_EPSILON      = param<double>("scan_matcher.gicp.transformation_epsilon", 1e-6);
       GICP_MAX_CORRESPONDENCE_DISTANCE = param<double>("scan_matcher.gicp.max_correspondence_distance", 1.0);
       SGICP_NUM_THREADS = param<int>("scan_matcher.sgicp.num_threads", 4);
+      SGICP_MAX_ITERATIONS = param<int>("scan_matcher.sgicp.max_iterations", 50);
       SGICP_CORRESPONDENCE_RANDOMNESS = param<int>("scan_matcher.sgicp.correspondence_randomness", 20);
       SGICP_MAX_CORRESPONDENCE_DISTANCE = param<double>("scan_matcher.sgicp.max_correspondence_distance", 1.0);
       SGICP_VOXEL_RESOLUTION = param<double>("scan_matcher.sgicp.voxel_resolution", 1.0);
@@ -178,6 +179,7 @@ namespace simple_slam {
     double GICP_TRANSFORMATION_EPSILON;
     double GICP_MAX_CORRESPONDENCE_DISTANCE;
     int SGICP_NUM_THREADS;
+    int SGICP_MAX_ITERATIONS;
     int SGICP_CORRESPONDENCE_RANDOMNESS;
     double SGICP_MAX_CORRESPONDENCE_DISTANCE;
     double SGICP_VOXEL_RESOLUTION;
@@ -475,6 +477,7 @@ namespace simple_slam {
           small_gicp::RegistrationPCL<POINT_TYPE, POINT_TYPE> reg;
           reg.setInputTarget(target);
           reg.setInputSource(source);
+          reg.setMaximumIterations(SGICP_MAX_ITERATIONS);
           reg.setNumThreads(SGICP_NUM_THREADS);
           reg.setCorrespondenceRandomness(SGICP_CORRESPONDENCE_RANDOMNESS);
           reg.setMaxCorrespondenceDistance(SGICP_MAX_CORRESPONDENCE_DISTANCE);

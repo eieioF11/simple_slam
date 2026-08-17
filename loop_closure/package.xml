@@ -21,7 +21,7 @@
   <depend>tbb</depend>
   <depend>pcl_conversions</depend>
   <depend>libpcl-all-dev</depend>
-  <!-- <depend>small_gicp</depend> -->
+  <depend>small_gicp</depend>
 
   <depend>common_utils</depend>
   <depend>extension_node</depend>
