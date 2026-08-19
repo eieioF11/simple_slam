@@ -36,8 +36,16 @@ The package depends on the following libraries and ROS 2 packages:
 
 ### Internal workspace dependencies
 
-- common_utils
-- extension_node
+The required `common_utils` and `extension_node` packages are bundled in the [ros2_common_tools](https://github.com/eieioF11/ros2_common_tools) repository.
+
+To install them, please clone the repository and initialize the submodules:
+
+```bash
+cd ros2_ws/src
+git clone https://github.com/eieioF11/ros2_common_tools.git
+cd ros2_common_tools
+git submodule update --init --recursive
+```
 
 ### Ubuntu / system packages
 
