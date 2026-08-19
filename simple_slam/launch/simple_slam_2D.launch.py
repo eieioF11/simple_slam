@@ -43,7 +43,8 @@ def generate_launch_description():
         name='simple_slam_container',
         namespace='',
         package='rclcpp_components',
-        executable='component_container',
+        # executable='component_container',
+        executable='component_container_mt',
         arguments=['--ros-args', '--log-level', 'DEBUG'],
         composable_node_descriptions=[
             #Scan Matcher
