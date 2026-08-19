@@ -1,0 +1,8 @@
+/**:
+  ros__parameters:
+    pose_graph_optimizer:
+      use_imu: false
+      isam2:
+        relinearizeThreshold: 0.1 # [double] 再線形化を行う閾値
+        relinearizeSkip: 1 # [int] 再線形化をスキップする回数
+        update_num: 3 # [int] ISAM2の更新回数

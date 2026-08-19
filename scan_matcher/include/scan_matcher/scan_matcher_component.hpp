@@ -22,9 +22,13 @@
 #include <pcl/registration/ndt.h>
 #include <pcl_conversions/pcl_conversions.h>
 
+// small GICP
+#include <small_gicp/pcl/pcl_registration.hpp>
+
 // ROS 2 TF & Msgs
 #include <geometry_msgs/msg/transform_stamped.hpp>
-#include <nav_msgs/msg/odometry.hpp> // ★追加: Odometry用ヘッダー
+#include <nav_msgs/msg/odometry.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp> // ★追加: 2D LiDARスキャン用
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_ros/buffer.h>
@@ -56,11 +60,9 @@
 
 #define _ENABLE_ATOMIC_ALIGNMENT_FIX
 
-// デバック関連設定
-#define N 1000
-#define SCALE 0.01
-
 #define PCL_POINT_TYPE pcl::PointXYZ
+#define FAKE_3D_POINT_Z 0.1
+
 using namespace std::chrono_literals;
 
 namespace simple_slam {
@@ -84,36 +86,51 @@ namespace simple_slam {
       RCLCPP_INFO(this->get_logger(), "Starting Scan Matcher Node...");
 
       // setup
-      SMAP_PUBLISH_RATE = param<double>("scan_matcher.storage_map.publish_rate", 1.0);
-      VOXELGRID_SIZE    = param<double>("scan_matcher.voxel_grid.size", 0.2);
-      RADIUS_OUTLIER_REMOVAL_RADIUS = param<double>("scan_matcher.radius_outlier_removal.radius", 0.5);
+      map_frame_id_   = param<std::string>("scan_matcher.map_frame_id", "map");
+      base_frame_id_  = param<std::string>("scan_matcher.base_frame_id", "base_link");
+      SMAP_PUBLISH_RATE                    = param<double>("scan_matcher.storage_map.publish_rate", 1.0);
+      VOXELGRID_SIZE                       = param<double>("scan_matcher.voxel_grid.size", 0.2);
+      RADIUS_OUTLIER_REMOVAL_RADIUS        = param<double>("scan_matcher.radius_outlier_removal.radius", 0.5);
       RADIUS_OUTLIER_REMOVAL_MIN_NEIGHBORS = param<int>("scan_matcher.radius_outlier_removal.min_neighbors", 2);
       // キーフレーム更新の閾値
       KF_MIN_TRANS = param<double>("scan_matcher.keyframe.min_trans", 0.5);
       KF_MIN_ROT   = param<double>("scan_matcher.keyframe.min_rot", 0.3);
-
+      // ローカルマップのウィンドウサイズ
       LOCAL_MAP_WINDOW_SIZE = param<int>("scan_matcher.local_map.window_size", 10);
-
+      // 停止判定の閾値
       STOP_VELOCITY_TRANS = param<double>("scan_matcher.stop_velocity.trans", 0.01);
       STOP_VELOCITY_ROT   = param<double>("scan_matcher.stop_velocity.rot", 0.008);
+      // Scan Matcher Parameters
+      ICP_MAX_ITERATIONS               = param<int>("scan_matcher.icp.max_iterations", 50);
+      ICP_TRANSFORMATION_EPSILON       = param<double>("scan_matcher.icp.transformation_epsilon", 1e-6);
+      ICP_MAX_CORRESPONDENCE_DISTANCE  = param<double>("scan_matcher.icp.max_correspondence_distance", 1.0);
+      NDT_RESOLUTION                   = param<double>("scan_matcher.ndt.resolution", 1.0);
+      NDT_MAX_ITERATIONS               = param<int>("scan_matcher.ndt.max_iterations", 35);
+      NDT_TRANSFORMATION_EPSILON       = param<double>("scan_matcher.ndt.transformation_epsilon", 0.01);
+      NDT_STEP_SIZE                    = param<double>("scan_matcher.ndt.step_size", 0.1);
+      GICP_MAX_ITERATIONS              = param<int>("scan_matcher.gicp.max_iterations", 50);
+      GICP_TRANSFORMATION_EPSILON      = param<double>("scan_matcher.gicp.transformation_epsilon", 1e-6);
+      GICP_MAX_CORRESPONDENCE_DISTANCE = param<double>("scan_matcher.gicp.max_correspondence_distance", 1.0);
+      SGICP_NUM_THREADS = param<int>("scan_matcher.sgicp.num_threads", 4);
+      SGICP_MAX_ITERATIONS = param<int>("scan_matcher.sgicp.max_iterations", 50);
+      SGICP_CORRESPONDENCE_RANDOMNESS = param<int>("scan_matcher.sgicp.correspondence_randomness", 20);
+      SGICP_MAX_CORRESPONDENCE_DISTANCE = param<double>("scan_matcher.sgicp.max_correspondence_distance", 1.0);
+      SGICP_VOXEL_RESOLUTION = param<double>("scan_matcher.sgicp.voxel_resolution", 1.0);
+      SGICP_REGISTRATION_TYPE = param<std::string>("scan_matcher.sgicp.registration_type", "VGICP");
 
+      // Scan Matcher Type
       scan_matcher_type_ = static_cast<ScanMatcherType>(param<int>("scan_matcher.type", 0));
-
+      // Logger
       logger_                                                                = spdlog::get("scan_matcher_logger");
       std::unordered_map<ScanMatcherType, std::string> scan_matcher_type_map = {{ScanMatcherType::ICP, "ICP"},
                                                                                 {ScanMatcherType::NDT, "NDT"},
                                                                                 {ScanMatcherType::GICP, "GICP"},
-                                                                                {ScanMatcherType::GICP_OMP, "GICP_OMP"},
                                                                                 {ScanMatcherType::SMALL_GICP, "SMALL_GICP"}};
       if (scan_matcher_type_map.find(scan_matcher_type_) == scan_matcher_type_map.end()) {
         spdlog::error("Invalid scan matcher type: {}", static_cast<int>(scan_matcher_type_));
         throw std::runtime_error("Invalid scan matcher type");
       }
       spdlog::info("Scan Matcher Type = {}", scan_matcher_type_map[scan_matcher_type_]);
-      spdlog::info("Scan Matcher Node initialized with parameters: "
-                   "\nSMAP_PUBLISH_RATE={}\nVOXELGRID_SIZE={}\nKF_MIN_TRANS={}\nKF_MIN_ROT={}\nLOCAL_MAP_WINDOW_SIZE={}\nSTOP_VELOCITY_TRANS={}"
-                   "\nSTOP_VELOCITY_ROT={}",
-                   SMAP_PUBLISH_RATE, VOXELGRID_SIZE, KF_MIN_TRANS, KF_MIN_ROT, LOCAL_MAP_WINDOW_SIZE, STOP_VELOCITY_TRANS, STOP_VELOCITY_ROT);
 
       // TF Broadcaster
       tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -123,11 +140,14 @@ namespace simple_slam {
       map_pub_       = this->create_publisher<sensor_msgs::msg::PointCloud2>("scan_matcher/local_map", rclcpp::QoS(1), rclcpp::PublisherOptions());
       keyframe_odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("scan_matcher/keyframe_odom", rclcpp::QoS(10));
 
-      // subscriber
+      // subscriber (3D と 2D の両方を待ち受ける)
       cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>("in_points", rclcpp::QoS(10),
                                                                             std::bind(&ScanMatcher::cloud_callback, this, std::placeholders::_1));
+      scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>("in_scan", rclcpp::QoS(10),
+                                                                         std::bind(&ScanMatcher::scan_callback, this, std::placeholders::_1));
+      // timer
       double smap_publish_rate = 1.0 / SMAP_PUBLISH_RATE;
-      timer_ = this->create_wall_timer(1s * smap_publish_rate, [&]() {
+      timer_                   = this->create_wall_timer(1s * smap_publish_rate, [&]() {
         if (!local_map_->empty()) {
           sensor_msgs::msg::PointCloud2 map_msg;
           pcl::toROSMsg(*local_map_, map_msg);
@@ -148,7 +168,27 @@ namespace simple_slam {
     double STOP_VELOCITY_TRANS;
     double STOP_VELOCITY_ROT;
     size_t LOCAL_MAP_WINDOW_SIZE;
-    enum class ScanMatcherType { ICP, NDT, GICP, GICP_OMP, SMALL_GICP } scan_matcher_type_;
+    int ICP_MAX_ITERATIONS;
+    double ICP_TRANSFORMATION_EPSILON;
+    double ICP_MAX_CORRESPONDENCE_DISTANCE;
+    double NDT_RESOLUTION;
+    int NDT_MAX_ITERATIONS;
+    double NDT_TRANSFORMATION_EPSILON;
+    double NDT_STEP_SIZE;
+    int GICP_MAX_ITERATIONS;
+    double GICP_TRANSFORMATION_EPSILON;
+    double GICP_MAX_CORRESPONDENCE_DISTANCE;
+    int SGICP_NUM_THREADS;
+    int SGICP_MAX_ITERATIONS;
+    int SGICP_CORRESPONDENCE_RANDOMNESS;
+    double SGICP_MAX_CORRESPONDENCE_DISTANCE;
+    double SGICP_VOXEL_RESOLUTION;
+    std::string SGICP_REGISTRATION_TYPE;
+
+    std::string map_frame_id_;
+    std::string base_frame_id_;
+
+    enum class ScanMatcherType { ICP, NDT, GICP, SMALL_GICP } scan_matcher_type_;
 
     std::shared_ptr<spdlog::logger> logger_;
 
@@ -169,11 +209,33 @@ namespace simple_slam {
 
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_; // ★追加
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr out_cloud_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr keyframe_odom_pub_;
 
+    // 2Dスキャン処理用のプロジェクターとモードフラグ
+    laser_geometry::LaserProjection projector_;
+    std::atomic<bool> is_2d_mode_{false};
+
+    // 2D LiDAR トピックコールバック
+    void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
+      is_2d_mode_ = true; // 2Dモードを有効化
+      // LaserScan を PointCloud2 に変換
+      sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
+      projector_.projectLaser(*msg, *cloud_msg);
+      // 共通の処理関数へ渡す
+      process_cloud(cloud_msg);
+    }
+
+    // 3D LiDAR トピックコールバック
     void cloud_callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+      is_2d_mode_ = false; // 2Dモードを無効化
+      process_cloud(msg);
+    }
+
+    // 実際の点群処理ロジック (統合版)
+    void process_cloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
       typename pcl::PointCloud<PCL_POINT_TYPE>::Ptr current_cloud(new pcl::PointCloud<PCL_POINT_TYPE>);
       pcl::fromROSMsg(*msg, *current_cloud);
 
@@ -191,18 +253,33 @@ namespace simple_slam {
       radius_outlier_removal.setMinNeighborsInRadius(RADIUS_OUTLIER_REMOVAL_MIN_NEIGHBORS);
       radius_outlier_removal.filter(*downsampled_cloud);
 
+      // 2Dモードの場合の厚み付け
+      if (is_2d_mode_) {
+        typename pcl::PointCloud<PCL_POINT_TYPE>::Ptr fake_3d_cloud(new pcl::PointCloud<PCL_POINT_TYPE>);
+        for (const auto& pt : downsampled_cloud->points) {
+          pcl::PointXYZ pt_top    = pt;
+          pt_top.z                = FAKE_3D_POINT_Z;
+          pcl::PointXYZ pt_bottom = pt;
+          pt_bottom.z             = -FAKE_3D_POINT_Z;
+          fake_3d_cloud->push_back(pt_top);
+          fake_3d_cloud->push_back(pt);
+          fake_3d_cloud->push_back(pt_bottom);
+        }
+        // ダウンサンプリングされた点群を、厚みを持たせた点群に差し替え
+        downsampled_cloud = fake_3d_cloud;
+      }
+
       // 初回フレームの処理
       if (local_map_->empty()) {
         *local_map_         = *downsampled_cloud;
         current_pose_       = Eigen::Matrix4d::Identity();
         previous_pose_      = Eigen::Matrix4d::Identity();
         last_keyframe_pose_ = Eigen::Matrix4d::Identity();
-        // spdlog::info("Initialized local map with first frame.");
-        RCLCPP_INFO(this->get_logger(), "Initialized local map with first frame.");
+        RCLCPP_INFO(this->get_logger(), "Initialized local map with first frame. (2D Mode: %s)", is_2d_mode_ ? "True" : "False");
         publish_tf(msg->header.stamp, current_pose_);
         sensor_msgs::msg::PointCloud2 out_msg;
         pcl::toROSMsg(*downsampled_cloud, out_msg);
-        out_msg.header.frame_id = "map";
+        out_msg.header.frame_id = map_frame_id_;
         out_msg.header.stamp    = msg->header.stamp;
         out_cloud_pub_->publish(out_msg);
         publish_keyframe_odom(msg->header.stamp, current_pose_);
@@ -211,13 +288,18 @@ namespace simple_slam {
 
       // 等速直線運動モデルによる初期位置（Initial Guess）の予測
       Eigen::Matrix4d velocity = previous_pose_.inverse() * current_pose_;
-      // 移動量と回転量を計算
-      double v_trans = velocity.block<3, 1>(0, 3).norm();
-      double v_rot   = Eigen::AngleAxisd(velocity.block<3, 3>(0, 0)).angle();
+      double v_trans           = velocity.block<3, 1>(0, 3).norm();
+      double v_rot             = Eigen::AngleAxisd(velocity.block<3, 3>(0, 0)).angle();
       if (v_trans < STOP_VELOCITY_TRANS && v_rot < STOP_VELOCITY_ROT) {
         velocity = Eigen::Matrix4d::Identity();
       }
-      RCLCPP_DEBUG(this->get_logger(), "Velocity: trans=%f, rot=%f", v_trans, v_rot);
+
+      // 2Dモード時は2D平面に限定
+      if (is_2d_mode_) {
+        velocity(2, 3)             = 0.0;
+        double vyaw                = std::atan2(velocity(1, 0), velocity(0, 0));
+        velocity.block<3, 3>(0, 0) = Eigen::AngleAxisd(vyaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+      }
 
       Eigen::Matrix4d initial_guess = current_pose_ * velocity;
 
@@ -226,6 +308,18 @@ namespace simple_slam {
       if (result.has_value()) {
         auto [score, tmat, aligned_cloud] = result.value();
         RCLCPP_DEBUG(this->get_logger(), "Scan matching successful. Fitness score: %f", score);
+
+        // 2Dモードの場合の強制クリッピング
+        if (is_2d_mode_) {
+          tmat(2, 3) = 0.0; // Z座標の浮きを0にリセット
+          double yaw = std::atan2(tmat(1, 0), tmat(0, 0));
+          Eigen::Matrix3d rot2d;
+          rot2d                  = Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+          tmat.block<3, 3>(0, 0) = rot2d; // ピッチとロールを捨てる
+
+          // クリッピングした正しい姿勢で点群を再度アライメント
+          pcl::transformPointCloud(*downsampled_cloud, aligned_cloud, tmat);
+        }
 
         // 姿勢の更新
         previous_pose_ = current_pose_;
@@ -237,9 +331,10 @@ namespace simple_slam {
         // アラインメントされた点群のパブリッシュ
         sensor_msgs::msg::PointCloud2 out_msg;
         pcl::toROSMsg(aligned_cloud, out_msg);
-        out_msg.header.frame_id = "map"; // マップ座標系に変換済み
+        out_msg.header.frame_id = map_frame_id_; // マップ座標系に変換済み
         out_msg.header.stamp    = msg->header.stamp;
         out_cloud_pub_->publish(out_msg);
+
         // キーフレームの更新判定
         Eigen::Matrix4d delta_pose = last_keyframe_pose_.inverse() * current_pose_;
         double delta_trans         = delta_pose.block<3, 1>(0, 3).norm();
@@ -247,7 +342,6 @@ namespace simple_slam {
         if (delta_trans > KF_MIN_TRANS || delta_rot > KF_MIN_ROT) {
           typename pcl::PointCloud<PCL_POINT_TYPE>::Ptr cloud_ptr(new pcl::PointCloud<PCL_POINT_TYPE>(aligned_cloud));
           recent_keyframes_.push_back(cloud_ptr);
-          // 古いキーフレームを削除
           if (recent_keyframes_.size() > LOCAL_MAP_WINDOW_SIZE) {
             recent_keyframes_.pop_front();
           }
@@ -263,7 +357,6 @@ namespace simple_slam {
           local_map_ = filtered_map;
 
           last_keyframe_pose_ = current_pose_;
-          // バックエンドにPoseを通知（実装済みの場合）
           publish_keyframe_odom(msg->header.stamp, current_pose_);
         }
       } else {
@@ -275,8 +368,8 @@ namespace simple_slam {
     void publish_tf(const rclcpp::Time& stamp, const Eigen::Matrix4d& pose) {
       geometry_msgs::msg::TransformStamped t;
       t.header.stamp    = stamp;
-      t.header.frame_id = "map";
-      t.child_frame_id  = "base_link";
+      t.header.frame_id = map_frame_id_;
+      t.child_frame_id  = base_frame_id_;
 
       t.transform.translation.x = pose(0, 3);
       t.transform.translation.y = pose(1, 3);
@@ -295,8 +388,8 @@ namespace simple_slam {
     void publish_keyframe_odom(const rclcpp::Time& stamp, const Eigen::Matrix4d& pose) {
       nav_msgs::msg::Odometry odom_msg;
       odom_msg.header.stamp    = stamp;
-      odom_msg.header.frame_id = "map";
-      odom_msg.child_frame_id  = "base_link";
+      odom_msg.header.frame_id = map_frame_id_;
+      odom_msg.child_frame_id  = base_frame_id_;
 
       odom_msg.pose.pose.position.x = pose(0, 3);
       odom_msg.pose.pose.position.y = pose(1, 3);
@@ -331,9 +424,9 @@ namespace simple_slam {
           pcl::IterativeClosestPoint<POINT_TYPE, POINT_TYPE> icp;
           icp.setInputTarget(target);
           icp.setInputSource(source);
-          icp.setMaximumIterations(50);
-          icp.setTransformationEpsilon(1e-6);
-          icp.setMaxCorrespondenceDistance(1.0);
+          icp.setMaximumIterations(ICP_MAX_ITERATIONS);
+          icp.setTransformationEpsilon(ICP_TRANSFORMATION_EPSILON);
+          icp.setMaxCorrespondenceDistance(ICP_MAX_CORRESPONDENCE_DISTANCE);
 
           icp.align(aligned_cloud, guess_f);
 
@@ -344,15 +437,14 @@ namespace simple_slam {
           }
           break;
         }
-
         case ScanMatcherType::NDT: {
           pcl::NormalDistributionsTransform<POINT_TYPE, POINT_TYPE> ndt;
           ndt.setInputTarget(target);
           ndt.setInputSource(source);
-          ndt.setResolution(1.0);
-          ndt.setMaximumIterations(35);
-          ndt.setTransformationEpsilon(0.01);
-          ndt.setStepSize(0.1);
+          ndt.setResolution(NDT_RESOLUTION);
+          ndt.setMaximumIterations(NDT_MAX_ITERATIONS);
+          ndt.setTransformationEpsilon(NDT_TRANSFORMATION_EPSILON);
+          ndt.setStepSize(NDT_STEP_SIZE);
 
           ndt.align(aligned_cloud, guess_f);
 
@@ -368,9 +460,9 @@ namespace simple_slam {
           pcl::GeneralizedIterativeClosestPoint<POINT_TYPE, POINT_TYPE> gicp;
           gicp.setInputTarget(target);
           gicp.setInputSource(source);
-          gicp.setMaximumIterations(50);
-          gicp.setTransformationEpsilon(1e-6);
-          gicp.setMaxCorrespondenceDistance(1.0);
+          gicp.setMaximumIterations(GICP_MAX_ITERATIONS);
+          gicp.setTransformationEpsilon(GICP_TRANSFORMATION_EPSILON);
+          gicp.setMaxCorrespondenceDistance(GICP_MAX_CORRESPONDENCE_DISTANCE);
 
           gicp.align(aligned_cloud, guess_f);
 
@@ -381,12 +473,25 @@ namespace simple_slam {
           }
           break;
         }
+        case ScanMatcherType::SMALL_GICP: {
+          small_gicp::RegistrationPCL<POINT_TYPE, POINT_TYPE> reg;
+          reg.setInputTarget(target);
+          reg.setInputSource(source);
+          reg.setMaximumIterations(SGICP_MAX_ITERATIONS);
+          reg.setNumThreads(SGICP_NUM_THREADS);
+          reg.setCorrespondenceRandomness(SGICP_CORRESPONDENCE_RANDOMNESS);
+          reg.setMaxCorrespondenceDistance(SGICP_MAX_CORRESPONDENCE_DISTANCE);
+          reg.setVoxelResolution(SGICP_VOXEL_RESOLUTION);
+          reg.setRegistrationType(SGICP_REGISTRATION_TYPE);
 
-        case ScanMatcherType::GICP_OMP:
-        case ScanMatcherType::SMALL_GICP:
-          spdlog::warn("External GICP not implemented. Use standard GICP.");
-          RCLCPP_WARN(this->get_logger(), "External GICP not implemented. Use standard GICP.");
-          break;
+          reg.align(aligned_cloud, guess_f);
+          if (reg.hasConverged()) {
+            fitness_score  = reg.getFitnessScore();
+            transformation = reg.getFinalTransformation().template cast<double>();
+            return std::make_tuple(fitness_score, transformation, aligned_cloud);
+          }
+        }
+        break;
       }
 
       return std::nullopt;

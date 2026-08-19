@@ -39,7 +39,7 @@ ament_auto_add_library(${PROJECT_NAME}_component SHARED
 target_include_directories(${PROJECT_NAME}_component PRIVATE
   include
   ${PCL_INCLUDE_DIRS}
-  # ${small_gicp_INCLUDE_DIRS}
+  ${small_gicp_INCLUDE_DIRS}
 )
 
 rclcpp_components_register_node(${PROJECT_NAME}_component
@@ -51,7 +51,7 @@ target_link_libraries(${PROJECT_NAME}_component
   Iridescence::Iridescence
   spdlog::spdlog_header_only
   ${PCL_LIBRARIES}
-  # small_gicp::small_gicp
+  small_gicp::small_gicp
 )
 target_compile_definitions(${PROJECT_NAME}_component PRIVATE ${PCL_DEFINITIONS})
 
