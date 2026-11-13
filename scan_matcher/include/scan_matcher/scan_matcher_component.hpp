@@ -28,7 +28,7 @@
 // ROS 2 TF & Msgs
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
-#include <sensor_msgs/msg/laser_scan.hpp> // ★追加: 2D LiDARスキャン用
+#include <sensor_msgs/msg/laser_scan.hpp>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_ros/buffer.h>
