@@ -79,7 +79,7 @@ namespace simple_slam {
         prev_bias_         = gtsam::imuBias::ConstantBias();
         imu_preintegrated_ = std::make_shared<gtsam::PreintegratedImuMeasurements>(preint_params, prev_bias_);
 
-        imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>("imu/data", rclcpp::QoS(500),
+        imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>("imu", rclcpp::QoS(500),
                                                                     std::bind(&PoseGraphOptimizer::imuCallback, this, std::placeholders::_1));
       }
 
@@ -138,7 +138,15 @@ namespace simple_slam {
         last_imu_time_ = current_time;
         return;
       }
-      double dt      = current_time - last_imu_time_;
+
+      double dt = current_time - last_imu_time_;
+
+      if (dt <= 0.0) {
+        RCLCPP_DEBUG_STREAM(this->get_logger(), "Ignored IMU data with dt <= 0 (dt = " << dt << ")");
+        return;
+      }
+
+      // 有効なデータの場合のみ、前回の時間を更新する
       last_imu_time_ = current_time;
 
       gtsam::Vector3 acc(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z);
@@ -268,7 +276,7 @@ namespace simple_slam {
       }
       path_pub_->publish(path_msg);
     }
-
+  };
 } // namespace simple_slam
 
 #include <rclcpp_components/register_node_macro.hpp>
