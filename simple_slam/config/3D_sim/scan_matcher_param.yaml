@@ -1,0 +1,50 @@
+/**:
+  ros__parameters:
+    scan_matcher:
+      map_frame_id: "map" # [string] マップ座標系のフレームID
+      base_frame_id: "base_link" # [string] ベース座標系のフレームID
+      type: 3 # [int] 0: ICP, 1: NDT, 2: GICP, 3: SGICP
+      storage_map:
+        publish_rate: 10.0 # [double] マップのPublishレート [Hz]
+
+      voxel_grid:
+        size: 0.1 # [double] ボクセルグリッドフィルタのサイズ [m]
+
+      radius_outlier_removal:
+        radius: 0.5 # [double] 外れ値除去の半径 [m]
+        min_neighbors: 2 # [int] 外れ値とみなす最小近傍数
+
+      keyframe:
+        min_trans: 0.3 # [double] キーフレームを更新する最小並進移動量 [m]
+        min_rot: 0.3 # [double] キーフレームを更新する最小回転移動量 [rad]
+
+      local_map:
+        window_size: 10 # [int] ローカルマップを構築するためのウィンドウサイズ（フレーム数）
+
+      stop_velocity:
+        trans: 0.01 # [double] 停止状態とみなす並進速度の閾値 [m/s]
+        rot: 0.008 # [double] 停止状態とみなす回転速度の閾値 [rad/s]
+
+      icp:
+        max_iterations: 50 # [int] ICPの最大反復回数
+        transformation_epsilon: 1.0e-6 # [double] ICPの変換収束条件
+        max_correspondence_distance: 1.0 # [double] ICPの最大対応点距離
+
+      ndt:
+        resolution: 1.0 # [double] NDTのボクセルグリッド解像度 [m]
+        max_iterations: 35 # [int] NDTの最大反復回数
+        transformation_epsilon: 0.01 # [double] NDTの変換収束条件
+        step_size: 0.1 # [double] NDTのステップサイズ
+
+      gicp:
+        max_iterations: 50 # [int] GICPの最大反復回数
+        transformation_epsilon: 1.0e-6 # [double] GICPの変換収束条件
+        max_correspondence_distance: 1.0 # [double] GICPの最大対応点距離
+
+      sgicp:
+        max_iterations: 50 # [int] SGICPの最大反復回数
+        num_threads: 2 # [int] SGICPのスレッド数
+        correspondence_randomness: 20 # [int] SGICPの対応点ランダム性
+        max_correspondence_distance: 1.0 # [double] SGICPの最大対応点距離
+        voxel_resolution: 1.0 # [double] SGICPのボクセル解像度 [m]
+        registration_type: "GICP" # [string] SGICPの登録タイプ ("VGICP" or "GICP")
