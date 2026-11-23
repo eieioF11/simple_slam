@@ -7,6 +7,9 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <tf2_ros/transform_broadcaster.h>
+
 // extention node
 #include "extension_node/extension_node.hpp"
 
@@ -79,6 +82,19 @@ namespace simple_slam {
         preint_params->gyroscopeCovariance     = gtsam::Matrix33::Identity() * std::pow(0.1, 2);
         preint_params->integrationCovariance   = gtsam::Matrix33::Identity() * std::pow(1e-4, 2);
 
+        // GLIMフォーマット: TUM形式 [x, y, z, qx, qy, qz, qw]
+        std::vector<double> ext    = param<std::vector<double>>("pose_graph_optimizer.T_lidar_imu", {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0});
+        gtsam::Pose3 body_P_sensor = gtsam::Pose3();
+
+        if (ext.size() == 7) {
+          // GTSAMのQuaternionコンストラクタは (w, x, y, z) の順で受け取るためインデックスを調整
+          body_P_sensor = gtsam::Pose3(gtsam::Rot3::Quaternion(ext[6], ext[3], ext[4], ext[5]), gtsam::Point3(ext[0], ext[1], ext[2]));
+        } else {
+          RCLCPP_WARN(this->get_logger(), "Invalid T_lidar_imu size (expected 7 for [x,y,z,qx,qy,qz,qw]). Using identity.");
+        }
+
+        preint_params->setBodyPSensor(body_P_sensor);
+
         prev_bias_         = gtsam::imuBias::ConstantBias();
         imu_preintegrated_ = std::make_shared<gtsam::PreintegratedImuMeasurements>(preint_params, prev_bias_);
 
@@ -94,6 +110,11 @@ namespace simple_slam {
 
       path_pub_  = this->create_publisher<nav_msgs::msg::Path>("optimized_path", rclcpp::QoS(1));
       graph_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("factor_graph_markers", rclcpp::QoS(1));
+
+      tf_broadcaster_        = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+      map_to_odom_transform_ = gtsam::Pose3();
+
+      tf_timer_ = this->create_wall_timer(std::chrono::milliseconds(50), [this]() { publishMapToOdomTf(); });
     }
 
   private:
@@ -106,8 +127,6 @@ namespace simple_slam {
     std::shared_ptr<spdlog::logger> logger_;
 
     std::mutex mtx_;
-
-    // ★ 前回の有効なマスターIDを記録
     int last_kf_id_ = -1;
 
     gtsam::Pose3 last_pose_;
@@ -117,6 +136,10 @@ namespace simple_slam {
     double last_imu_time_ = -1.0;
 
     std::deque<sensor_msgs::msg::Imu::SharedPtr> imu_buffer_;
+
+    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    rclcpp::TimerBase::SharedPtr tf_timer_;
+    gtsam::Pose3 map_to_odom_transform_;
 
     gtsam::noiseModel::Diagonal::shared_ptr prior_noise_;
     gtsam::noiseModel::Diagonal::shared_ptr odom_noise_;
@@ -131,6 +154,26 @@ namespace simple_slam {
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr graph_pub_;
 
+    void publishMapToOdomTf() {
+      std::lock_guard<std::mutex> lock(mtx_);
+      geometry_msgs::msg::TransformStamped t;
+      t.header.stamp    = this->now();
+      t.header.frame_id = "map";
+      t.child_frame_id  = "odom";
+
+      t.transform.translation.x = map_to_odom_transform_.x();
+      t.transform.translation.y = map_to_odom_transform_.y();
+      t.transform.translation.z = map_to_odom_transform_.z();
+
+      auto q                 = map_to_odom_transform_.rotation().toQuaternion();
+      t.transform.rotation.x = q.x();
+      t.transform.rotation.y = q.y();
+      t.transform.rotation.z = q.z();
+      t.transform.rotation.w = q.w();
+
+      tf_broadcaster_->sendTransform(t);
+    }
+
     void imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg) {
       if (!use_imu_) return;
       std::lock_guard<std::mutex> lock(mtx_);
@@ -140,12 +183,11 @@ namespace simple_slam {
     void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
       std::lock_guard<std::mutex> lock(mtx_);
 
-      // メッセージからマスターIDを抽出
       int kf_id = -1;
       try {
         kf_id = std::stoi(msg->child_frame_id);
       } catch (const std::exception& e) {
-        return; // 無効なIDは無視
+        return;
       }
 
       double current_odom_time = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
@@ -207,7 +249,6 @@ namespace simple_slam {
           }
         }
 
-        // 前回のキーフレームから現在のキーフレームへの制約を結ぶ
         gtsam::Pose3 relative_pose = last_pose_.between(current_pose);
         gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(X(last_kf_id_), X(kf_id), relative_pose, odom_noise_));
 
@@ -250,6 +291,11 @@ namespace simple_slam {
         imu_preintegrated_->resetIntegrationAndSetBias(prev_bias_);
       }
 
+      if (currentEstimate_.exists(X(kf_id))) {
+        gtsam::Pose3 opt_pose  = currentEstimate_.at<gtsam::Pose3>(X(kf_id));
+        map_to_odom_transform_ = opt_pose * current_pose.inverse();
+      }
+
       publishOptimizedPath(msg->header.stamp);
     }
 
@@ -266,7 +312,6 @@ namespace simple_slam {
 
       if (loop_target_id >= current_id) return;
 
-      // 受信した制約の両端がGTSAM内に実在するかチェック (非同期・欠損対策)
       if (!currentEstimate_.exists(X(current_id)) || !currentEstimate_.exists(X(loop_target_id))) {
         RCLCPP_WARN(this->get_logger(), "Loop closure node not found in graph. Ignored.");
         return;
@@ -288,6 +333,12 @@ namespace simple_slam {
       initialEstimate_.clear();
 
       currentEstimate_ = isam2_->calculateEstimate();
+
+      if (last_kf_id_ != -1 && currentEstimate_.exists(X(last_kf_id_))) {
+        gtsam::Pose3 opt_pose  = currentEstimate_.at<gtsam::Pose3>(X(last_kf_id_));
+        map_to_odom_transform_ = opt_pose * last_pose_.inverse();
+      }
+
       publishOptimizedPath(msg->header.stamp);
     }
 
@@ -296,7 +347,6 @@ namespace simple_slam {
       path_msg.header.stamp    = stamp;
       path_msg.header.frame_id = "map";
 
-      // GTSAMに保存されているキーをID順にソートして抽出
       std::map<int, gtsam::Pose3> sorted_poses;
       for (const auto& key_value : currentEstimate_) {
         gtsam::Symbol sym(key_value.key);
@@ -307,9 +357,7 @@ namespace simple_slam {
 
       for (const auto& [id, pose] : sorted_poses) {
         geometry_msgs::msg::PoseStamped pose_stamped;
-        pose_stamped.header = path_msg.header;
-
-        // ★ 各ポーズに対応するマスターIDを付与する
+        pose_stamped.header          = path_msg.header;
         pose_stamped.header.frame_id = std::to_string(id);
 
         pose_stamped.pose.position.x = pose.x();

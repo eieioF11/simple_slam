@@ -28,6 +28,7 @@
 // ROS 2 TF & Msgs
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
@@ -85,8 +86,9 @@ namespace simple_slam {
         : ext_rclcpp::ExtensionNode("scan_matcher", name_space, options), tf_buffer_(this->get_clock()), listener_(tf_buffer_) {
       RCLCPP_INFO(this->get_logger(), "Starting Scan Matcher Node...");
 
-      map_frame_id_                        = param<std::string>("scan_matcher.map_frame_id", "map");
-      base_frame_id_                       = param<std::string>("scan_matcher.base_frame_id", "base_link");
+      odom_frame_id_ = param<std::string>("scan_matcher.odom_frame_id", "odom");
+      base_frame_id_ = param<std::string>("scan_matcher.base_frame_id", "base_link");
+
       SMAP_PUBLISH_RATE                    = param<double>("scan_matcher.storage_map.publish_rate", 1.0);
       VOXELGRID_SIZE                       = param<double>("scan_matcher.voxel_grid.size", 0.2);
       RADIUS_OUTLIER_REMOVAL_RADIUS        = param<double>("scan_matcher.radius_outlier_removal.radius", 0.5);
@@ -113,6 +115,16 @@ namespace simple_slam {
       SGICP_VOXEL_RESOLUTION               = param<double>("scan_matcher.sgicp.voxel_resolution", 1.0);
       SGICP_REGISTRATION_TYPE              = param<std::string>("scan_matcher.sgicp.registration_type", "VGICP");
 
+      use_imu_                = param<bool>("scan_matcher.use_imu", false);
+      std::vector<double> ext = param<std::vector<double>>("scan_matcher.T_lidar_imu", {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0});
+      if (ext.size() == 7) {
+        Eigen::Quaterniond q(ext[6], ext[3], ext[4], ext[5]);
+        T_lidar_imu_rot_ = q.toRotationMatrix();
+      } else {
+        RCLCPP_WARN(this->get_logger(), "Invalid T_lidar_imu size. Using identity.");
+        T_lidar_imu_rot_ = Eigen::Matrix3d::Identity();
+      }
+
       scan_matcher_type_                                                     = static_cast<ScanMatcherType>(param<int>("scan_matcher.type", 0));
       logger_                                                                = spdlog::get("scan_matcher_logger");
       std::unordered_map<ScanMatcherType, std::string> scan_matcher_type_map = {
@@ -133,12 +145,18 @@ namespace simple_slam {
                                                                             std::bind(&ScanMatcher::cloud_callback, this, std::placeholders::_1));
       scan_sub_  = this->create_subscription<sensor_msgs::msg::LaserScan>("in_scan", rclcpp::QoS(10),
                                                                           std::bind(&ScanMatcher::scan_callback, this, std::placeholders::_1));
+
+      if (use_imu_) {
+        imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>("imu", rclcpp::QoS(10),
+                                                                    std::bind(&ScanMatcher::imu_callback, this, std::placeholders::_1));
+      }
+
       double smap_publish_rate = 1.0 / SMAP_PUBLISH_RATE;
       timer_                   = this->create_wall_timer(1s * smap_publish_rate, [&]() {
         if (!local_map_->empty()) {
           sensor_msgs::msg::PointCloud2 map_msg;
           pcl::toROSMsg(*local_map_, map_msg);
-          map_msg.header.frame_id = "map";
+          map_msg.header.frame_id = odom_frame_id_;
           map_msg.header.stamp    = this->now();
           map_pub_->publish(map_msg);
         }
@@ -172,7 +190,7 @@ namespace simple_slam {
     double SGICP_VOXEL_RESOLUTION;
     std::string SGICP_REGISTRATION_TYPE;
 
-    std::string map_frame_id_;
+    std::string odom_frame_id_;
     std::string base_frame_id_;
 
     enum class ScanMatcherType { ICP, NDT, GICP, SMALL_GICP } scan_matcher_type_;
@@ -181,18 +199,20 @@ namespace simple_slam {
 
     std::deque<typename pcl::PointCloud<PCL_POINT_TYPE>::Ptr> recent_keyframes_;
 
-    // Poses
     Eigen::Matrix4d current_pose_       = Eigen::Matrix4d::Identity();
     Eigen::Matrix4d previous_pose_      = Eigen::Matrix4d::Identity();
     Eigen::Matrix4d last_keyframe_pose_ = Eigen::Matrix4d::Identity();
 
-    // ★ マスターIDの発行用カウンタを追加
     int keyframe_id_counter_ = 0;
 
-    // PointClouds
+    bool use_imu_;
+    Eigen::Matrix3d T_lidar_imu_rot_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+    Eigen::Vector3d latest_gravity_ = Eigen::Vector3d(0, 0, 9.81);
+    bool gravity_initialized_       = false;
+
     typename pcl::PointCloud<PCL_POINT_TYPE>::Ptr local_map_{new pcl::PointCloud<PCL_POINT_TYPE>};
 
-    // TF & ROS
     tf2_ros::Buffer tf_buffer_;
     tf2_ros::TransformListener listener_;
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
@@ -206,6 +226,16 @@ namespace simple_slam {
 
     laser_geometry::LaserProjection projector_;
     std::atomic<bool> is_2d_mode_{false};
+
+    void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
+      Eigen::Vector3d acc(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z);
+      if (!gravity_initialized_) {
+        latest_gravity_      = acc;
+        gravity_initialized_ = true;
+      } else {
+        latest_gravity_ = 0.9 * latest_gravity_ + 0.1 * acc;
+      }
+    }
 
     void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
       is_2d_mode_                                        = true;
@@ -250,15 +280,32 @@ namespace simple_slam {
       }
 
       if (local_map_->empty()) {
-        *local_map_         = *downsampled_cloud;
-        current_pose_       = Eigen::Matrix4d::Identity();
-        previous_pose_      = Eigen::Matrix4d::Identity();
-        last_keyframe_pose_ = Eigen::Matrix4d::Identity();
+        current_pose_ = Eigen::Matrix4d::Identity();
+
+        if (use_imu_ && gravity_initialized_ && !is_2d_mode_) {
+          Eigen::Vector3d acc_body = T_lidar_imu_rot_ * latest_gravity_;
+          double roll              = std::atan2(acc_body.y(), acc_body.z());
+          double pitch             = std::atan2(-acc_body.x(), std::sqrt(acc_body.y() * acc_body.y() + acc_body.z() * acc_body.z()));
+
+          Eigen::Matrix3d R               = (Eigen::AngleAxisd(0.0, Eigen::Vector3d::UnitZ()) * Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY()) *
+                                             Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX()))
+                                                .toRotationMatrix();
+          current_pose_.block<3, 3>(0, 0) = R;
+          RCLCPP_INFO(this->get_logger(), "ScanMatcher Gravity Alignment Applied: Roll=%.3f, Pitch=%.3f", roll, pitch);
+
+          pcl::transformPointCloud(*downsampled_cloud, *downsampled_cloud, current_pose_.cast<float>());
+        }
+
+        *local_map_ = *downsampled_cloud;
+
+        previous_pose_      = current_pose_;
+        last_keyframe_pose_ = current_pose_;
         RCLCPP_INFO(this->get_logger(), "Initialized local map with first frame. (2D Mode: %s)", is_2d_mode_ ? "True" : "False");
+
         publish_tf(msg->header.stamp, current_pose_);
         sensor_msgs::msg::PointCloud2 out_msg;
         pcl::toROSMsg(*downsampled_cloud, out_msg);
-        out_msg.header.frame_id = map_frame_id_;
+        out_msg.header.frame_id = odom_frame_id_;
         out_msg.header.stamp    = msg->header.stamp;
         out_cloud_pub_->publish(out_msg);
         publish_keyframe_odom(msg->header.stamp, current_pose_);
@@ -301,7 +348,7 @@ namespace simple_slam {
 
         sensor_msgs::msg::PointCloud2 out_msg;
         pcl::toROSMsg(aligned_cloud, out_msg);
-        out_msg.header.frame_id = map_frame_id_;
+        out_msg.header.frame_id = odom_frame_id_;
         out_msg.header.stamp    = msg->header.stamp;
         out_cloud_pub_->publish(out_msg);
 
@@ -335,7 +382,7 @@ namespace simple_slam {
     void publish_tf(const rclcpp::Time& stamp, const Eigen::Matrix4d& pose) {
       geometry_msgs::msg::TransformStamped t;
       t.header.stamp    = stamp;
-      t.header.frame_id = map_frame_id_;
+      t.header.frame_id = odom_frame_id_;
       t.child_frame_id  = base_frame_id_;
 
       t.transform.translation.x = pose(0, 3);
@@ -355,10 +402,8 @@ namespace simple_slam {
     void publish_keyframe_odom(const rclcpp::Time& stamp, const Eigen::Matrix4d& pose) {
       nav_msgs::msg::Odometry odom_msg;
       odom_msg.header.stamp    = stamp;
-      odom_msg.header.frame_id = map_frame_id_;
-
-      // ★ child_frame_id を利用してマスターIDを後続ノードへ確実に渡す
-      odom_msg.child_frame_id = std::to_string(keyframe_id_counter_++);
+      odom_msg.header.frame_id = odom_frame_id_;
+      odom_msg.child_frame_id  = std::to_string(keyframe_id_counter_++);
 
       odom_msg.pose.pose.position.x = pose(0, 3);
       odom_msg.pose.pose.position.y = pose(1, 3);
@@ -396,9 +441,7 @@ namespace simple_slam {
           icp.setMaximumIterations(ICP_MAX_ITERATIONS);
           icp.setTransformationEpsilon(ICP_TRANSFORMATION_EPSILON);
           icp.setMaxCorrespondenceDistance(ICP_MAX_CORRESPONDENCE_DISTANCE);
-
           icp.align(aligned_cloud, guess_f);
-
           if (icp.hasConverged()) {
             fitness_score  = icp.getFitnessScore();
             transformation = icp.getFinalTransformation().template cast<double>();
@@ -414,9 +457,7 @@ namespace simple_slam {
           ndt.setMaximumIterations(NDT_MAX_ITERATIONS);
           ndt.setTransformationEpsilon(NDT_TRANSFORMATION_EPSILON);
           ndt.setStepSize(NDT_STEP_SIZE);
-
           ndt.align(aligned_cloud, guess_f);
-
           if (ndt.hasConverged()) {
             fitness_score  = ndt.getFitnessScore();
             transformation = ndt.getFinalTransformation().template cast<double>();
@@ -424,7 +465,6 @@ namespace simple_slam {
           }
           break;
         }
-
         case ScanMatcherType::GICP: {
           pcl::GeneralizedIterativeClosestPoint<POINT_TYPE, POINT_TYPE> gicp;
           gicp.setInputTarget(target);
@@ -432,9 +472,7 @@ namespace simple_slam {
           gicp.setMaximumIterations(GICP_MAX_ITERATIONS);
           gicp.setTransformationEpsilon(GICP_TRANSFORMATION_EPSILON);
           gicp.setMaxCorrespondenceDistance(GICP_MAX_CORRESPONDENCE_DISTANCE);
-
           gicp.align(aligned_cloud, guess_f);
-
           if (gicp.hasConverged()) {
             fitness_score  = gicp.getFitnessScore();
             transformation = gicp.getFinalTransformation().template cast<double>();
@@ -452,7 +490,6 @@ namespace simple_slam {
           reg.setMaxCorrespondenceDistance(SGICP_MAX_CORRESPONDENCE_DISTANCE);
           reg.setVoxelResolution(SGICP_VOXEL_RESOLUTION);
           reg.setRegistrationType(SGICP_REGISTRATION_TYPE);
-
           reg.align(aligned_cloud, guess_f);
           if (reg.hasConverged()) {
             fitness_score  = reg.getFitnessScore();
@@ -461,7 +498,6 @@ namespace simple_slam {
           }
         } break;
       }
-
       return std::nullopt;
     }
   };

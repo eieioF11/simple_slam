@@ -4,6 +4,19 @@
       map_frame_id: "map" # [string] マップ座標系のフレームID
       base_frame_id: "base_link" # [string] ベース座標系のフレームID
       type: 2 # [int] 0: ICP, 1: NDT, 2: GICP
+      use_imu: false
+      T_lidar_imu: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0] # T_lidar_imu: [x, y, z, qx, qy, qz, qw]
+      # LiDAR-IMU transformations for typical sensors (Do not trust these values blindly!):
+      # Ouster OS0: [0.006, -0.012, 0.008, 0.0, 0.0, 0.0, 1.0]
+      # Livox Avia: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+      # Realsense L515: [-0.012, 0.016, 0.001, 0.0, 0.0, 0.0, 1.0]
+      # Azure Kinect: [0.003, 0.004, -0.051, -0.476, 0.474, 0.524, 0.525]
+      # ZED2i: [-0.002, -0.023, 0.000, -0.002, -0.001, -0.002, 1.000]
+      # Newer college: [-0.006, 0.012, 0.029, 0.0, 0.0, 1.0, 0.0]
+      # Newer college multi-cam: [-0.014, 0.012, 0.015, 0.0, 0.0, 0.0, 1.0]
+      # Newer college multi-cam-imu: [0.02300, 0.00400, -0.01100, 1.00000, 0.00000, 0.00000, 0.00000]
+      # rooftop: [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+
       storage_map:
         publish_rate: 1.0 # [double] マップのPublishレート [Hz]
 

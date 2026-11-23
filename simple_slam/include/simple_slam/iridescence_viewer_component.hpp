@@ -364,10 +364,25 @@ namespace simple_slam {
           glBindTexture(GL_TEXTURE_2D, 0);
         }
 
+        // 1. map -> base_link (最適化後の真の現在位置)
         try {
           geometry_msgs::msg::TransformStamped transform_stamped = tf_buffer_->lookupTransform("map", "base_link", tf2::TimePointZero);
           Eigen::Matrix4f latest_pose                            = tf2::transformToEigen(transform_stamped.transform).matrix().cast<float>();
-          viewer->update_drawable("current_pose", glk::Primitives::coordinate_system(), guik::VertexColor().transform(latest_pose));
+          // サイズ1.0の座標軸として描画 (デフォルト)
+          viewer->update_drawable("current_pose_map", glk::Primitives::coordinate_system(), guik::VertexColor().transform(latest_pose));
+        } catch (const tf2::TransformException& ex) {
+        }
+
+        // 2. odom -> base_link (Scan Matcherが計算した滑らかなローカルオドメトリ位置)
+        try {
+          // odom座標系におけるロボットの位置を取得し、それをそのまま画面上の原点基準で描画する
+          geometry_msgs::msg::TransformStamped transform_stamped_odom = tf_buffer_->lookupTransform("odom", "base_link", tf2::TimePointZero);
+          Eigen::Matrix4f odom_pose = tf2::transformToEigen(transform_stamped_odom.transform).matrix().cast<float>();
+
+          // 区別しやすくするため、サイズを小さく (0.5倍) し、半透明にする
+          auto color_settings = guik::VertexColor().set_color(1.0f, 1.0f, 1.0f, 0.5f).make_transparent();
+
+          viewer->update_drawable("current_pose_odom", glk::Primitives::coordinate_system(), color_settings.transform(odom_pose).scale(0.5f));
         } catch (const tf2::TransformException& ex) {
         }
 
