@@ -7,9 +7,9 @@
 // extention node
 #include "extension_node/extension_node.hpp"
 
-// Message Filters (同期用)
+// Message Filters
 #include <message_filters/subscriber.h>
-#include <message_filters/sync_policies/exact_time.h>
+#include <message_filters/sync_policies/approximate_time.h>
 #include <message_filters/synchronizer.h>
 
 // PCL
@@ -33,7 +33,6 @@
 
 namespace simple_slam {
 
-  // キーフレームのデータを保持する構造体
   struct KeyFrame {
     int id;
     Eigen::Matrix4d pose;
@@ -46,9 +45,11 @@ namespace simple_slam {
 
       RCLCPP_INFO(this->get_logger(), "Starting Loop Closure Node...");
 
-      search_radius_        = param<double>("loop_closure.search_radius", 3.0);
-      skip_recent_frames_   = param<int>("loop_closure.skip_recent_frames", 50);
-      fitness_score_thresh_ = param<double>("loop_closure.fitness_score_thresh", 0.3);
+      search_radius_      = param<double>("loop_closure.search_radius", 3.0);
+      skip_recent_frames_ = param<int>("loop_closure.skip_recent_frames", 50);
+
+      // 似た環境での誤検知を防ぐため、デフォルトのフィットネススコアを0.15に厳格化
+      fitness_score_thresh_ = param<double>("loop_closure.fitness_score_thresh", 0.15);
       voxel_size_           = param<double>("loop_closure.voxel_size", 0.3);
 
       GICP_MAX_ITERATIONS             = param<int>("loop_closure.gicp.max_iterations", 50);
@@ -57,15 +58,12 @@ namespace simple_slam {
       SGICP_VOXEL_RESOLUTION          = param<double>("loop_closure.sgicp.voxel_resolution", 1.0);
       SGICP_REGISTRATION_TYPE         = param<std::string>("loop_closure.sgicp.registration_type", "VGICP");
 
-      // Publisher (Pose Graph Optimizer へ送信する制約)
       loop_constraint_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("loop_closure/constraint", rclcpp::QoS(10));
 
-      // Subscribers (OdometryとPointCloud2を同期して受信)
       odom_sub_.subscribe(this, "scan_matcher/keyframe_odom");
-      cloud_sub_.subscribe(this, "scan_matcher/local_map");
-      // cloud_sub_.subscribe(this, "scan_matcher/out_points");
+      cloud_sub_.subscribe(this, "scan_matcher/out_points");
 
-      sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(SyncPolicy(10), odom_sub_, cloud_sub_);
+      sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(SyncPolicy(50), odom_sub_, cloud_sub_);
       sync_->registerCallback(std::bind(&LoopClosure::syncCallback, this, std::placeholders::_1, std::placeholders::_2));
     }
 
@@ -85,8 +83,11 @@ namespace simple_slam {
     std::mutex mtx_;
     int current_id_ = 0;
 
-    // 同期用の型定義
-    using SyncPolicy = message_filters::sync_policies::ExactTime<nav_msgs::msg::Odometry, sensor_msgs::msg::PointCloud2>;
+    // ループIDの連続性チェック用履歴
+    int last_matched_current_id_ = -1;
+    int last_matched_target_id_  = -1;
+
+    using SyncPolicy = message_filters::sync_policies::ApproximateTime<nav_msgs::msg::Odometry, sensor_msgs::msg::PointCloud2>;
     message_filters::Subscriber<nav_msgs::msg::Odometry> odom_sub_;
     message_filters::Subscriber<sensor_msgs::msg::PointCloud2> cloud_sub_;
     std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> sync_;
@@ -94,10 +95,8 @@ namespace simple_slam {
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr loop_constraint_pub_;
 
     void syncCallback(const nav_msgs::msg::Odometry::ConstSharedPtr& odom_msg, const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud_msg) {
-
       std::lock_guard<std::mutex> lock(mtx_);
 
-      // 1. データの変換
       Eigen::Matrix4d current_pose   = Eigen::Matrix4d::Identity();
       current_pose.block<3, 3>(0, 0) = Eigen::Quaterniond(odom_msg->pose.pose.orientation.w, odom_msg->pose.pose.orientation.x,
                                                           odom_msg->pose.pose.orientation.y, odom_msg->pose.pose.orientation.z)
@@ -109,53 +108,45 @@ namespace simple_slam {
       pcl::PointCloud<pcl::PointXYZ>::Ptr current_cloud(new pcl::PointCloud<pcl::PointXYZ>);
       pcl::fromROSMsg(*cloud_msg, *current_cloud);
 
-      // ダウンサンプリングして保持（メモリと計算コストの削減）
       pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZ>);
       pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
       voxel_filter.setLeafSize(voxel_size_, voxel_size_, voxel_size_);
       voxel_filter.setInputCloud(current_cloud);
       voxel_filter.filter(*downsampled_cloud);
 
-      // キーフレームとして履歴に追加
       KeyFrame kf;
       kf.id    = current_id_++;
       kf.pose  = current_pose;
       kf.cloud = downsampled_cloud;
       keyframes_.push_back(kf);
 
-      // ループ探索 (過去のキーフレームとの距離を比較)
       if (keyframes_.size() < skip_recent_frames_ + 1) {
-        return; // 履歴が少ない場合はスキップ
+        return;
       }
 
-      int loop_candidate_id = -1;
-      double min_dist       = search_radius_;
-
+      int loop_candidate_id       = -1;
+      double min_dist             = search_radius_;
       Eigen::Vector3d current_pos = current_pose.block<3, 1>(0, 3);
 
-      // 直近のフレームは探索対象から外す
       for (size_t i = 0; i < keyframes_.size() - skip_recent_frames_; ++i) {
         Eigen::Vector3d past_pos = keyframes_[i].pose.block<3, 1>(0, 3);
-        double dist              = (current_pos - past_pos).norm();
+        double dist_2d           = (current_pos.head<2>() - past_pos.head<2>()).norm();
 
-        if (dist < min_dist) {
-          min_dist          = dist;
+        if (dist_2d < min_dist) {
+          min_dist          = dist_2d;
           loop_candidate_id = keyframes_[i].id;
         }
       }
 
-      // ループ候補が見つかった場合、ICPマッチングで検証
       if (loop_candidate_id != -1) {
         verifyLoopClosure(loop_candidate_id, kf, odom_msg->header.stamp);
       }
     }
 
     void verifyLoopClosure(int target_id, const KeyFrame& current_kf, const rclcpp::Time& stamp) {
-
       pcl::PointCloud<pcl::PointXYZ>::Ptr target_cloud = keyframes_[target_id].cloud;
       pcl::PointCloud<pcl::PointXYZ>::Ptr source_cloud = current_kf.cloud;
 #ifdef USE_SMALL_GICP
-      // SGICPによる位置合わせ
       small_gicp::RegistrationPCL<pcl::PointXYZ, pcl::PointXYZ> gicp;
       gicp.setInputTarget(target_cloud);
       gicp.setInputSource(source_cloud);
@@ -166,7 +157,6 @@ namespace simple_slam {
       gicp.setVoxelResolution(SGICP_VOXEL_RESOLUTION);
       gicp.setRegistrationType(SGICP_REGISTRATION_TYPE);
 #else
-      // GICPによる位置合わせ
       pcl::GeneralizedIterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> gicp;
       gicp.setInputTarget(target_cloud);
       gicp.setInputSource(source_cloud);
@@ -174,16 +164,30 @@ namespace simple_slam {
       gicp.setMaxCorrespondenceDistance(search_radius_ * 2.0);
 #endif
 
-      // ICPの初期値（Initial Guess）として、オドメトリ上の相対ポーズを与える
       Eigen::Matrix4d initial_guess = keyframes_[target_id].pose.inverse() * current_kf.pose;
 
       pcl::PointCloud<pcl::PointXYZ> aligned_cloud;
       gicp.align(aligned_cloud, initial_guess.cast<float>());
 
       if (gicp.hasConverged() && gicp.getFitnessScore() < fitness_score_thresh_) {
-
-        // 最適化された相対ポーズを取得
         Eigen::Matrix4d relative_pose = gicp.getFinalTransformation().cast<double>();
+
+        // 1. Z軸の異常なズレを弾く (階段でない限り1.0m以上の高さ変化は異常)
+        double z_diff = std::abs(relative_pose(2, 3));
+        if (z_diff > 1.0) {
+          RCLCPP_WARN(this->get_logger(), "Rejected Loop Closure: Large Z diff (%f m)", z_diff);
+          return;
+        }
+
+        // 2. ICPの移動量制限 (探索半径以上に強引に引き寄せた場合は別の部屋の可能性大)
+        Eigen::Matrix4d diff = initial_guess.inverse() * relative_pose;
+        double delta_trans   = diff.block<3, 1>(0, 3).norm();
+        if (delta_trans > search_radius_) {
+          RCLCPP_WARN(this->get_logger(), "Rejected Loop Closure: ICP moved too far (%f m)", delta_trans);
+          return;
+        }
+
+        // ※連続性チェック（ジャンプ防止）は副作用が強いため削除しました。
 
         RCLCPP_INFO(this->get_logger(), "Loop Closure Detected! %d -> %d (Score: %f)", current_kf.id, target_id, gicp.getFitnessScore());
 
@@ -193,9 +197,7 @@ namespace simple_slam {
 
     void publishLoopConstraint(int target_id, const Eigen::Matrix4d& relative_pose, const rclcpp::Time& stamp) {
       nav_msgs::msg::Odometry constraint_msg;
-      constraint_msg.header.stamp = stamp;
-
-      // PGOノード側で読み取るため、frame_idにターゲットIDを文字列として仕込む
+      constraint_msg.header.stamp    = stamp;
       constraint_msg.header.frame_id = std::to_string(target_id);
       constraint_msg.child_frame_id  = "loop_constraint";
 

@@ -31,6 +31,7 @@
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
 
+#include <deque>
 #include <mutex>
 #include <vector>
 
@@ -64,7 +65,11 @@ namespace simple_slam {
       // ノイズモデルの定義
       prior_noise_ = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
       odom_noise_  = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1e-2, 1e-2, 1e-2, 1e-3, 1e-3, 1e-3).finished());
-      loop_noise_  = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 5e-2, 5e-2, 5e-2, 1e-2, 1e-2, 1e-2).finished());
+
+      // ループクロージャのノイズモデルにロバストカーネル（Huber関数）を適用し、外れ値への耐性を高める
+      auto base_loop_noise = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 5e-2, 5e-2, 5e-2, 1e-2, 1e-2, 1e-2).finished());
+      auto huber           = gtsam::noiseModel::mEstimator::Huber::Create(1.0);
+      loop_noise_          = gtsam::noiseModel::Robust::Create(huber, base_loop_noise);
 
       if (use_imu_) {
         prior_vel_noise_  = gtsam::noiseModel::Isotropic::Sigma(3, 1e-2);
@@ -114,10 +119,13 @@ namespace simple_slam {
     std::shared_ptr<gtsam::PreintegratedImuMeasurements> imu_preintegrated_;
     double last_imu_time_ = -1.0;
 
+    // IMUデータを一時保存するバッファ
+    std::deque<sensor_msgs::msg::Imu::SharedPtr> imu_buffer_;
+
     // Noise Models
     gtsam::noiseModel::Diagonal::shared_ptr prior_noise_;
     gtsam::noiseModel::Diagonal::shared_ptr odom_noise_;
-    gtsam::noiseModel::Diagonal::shared_ptr loop_noise_;
+    gtsam::noiseModel::Base::shared_ptr loop_noise_;
     gtsam::noiseModel::Isotropic::shared_ptr prior_vel_noise_;
     gtsam::noiseModel::Isotropic::shared_ptr prior_bias_noise_;
     gtsam::noiseModel::Isotropic::shared_ptr bias_rw_noise_;
@@ -132,37 +140,36 @@ namespace simple_slam {
       if (!use_imu_) return;
 
       std::lock_guard<std::mutex> lock(mtx_);
-      double current_time = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
-
-      if (last_imu_time_ < 0) {
-        last_imu_time_ = current_time;
-        return;
-      }
-
-      double dt = current_time - last_imu_time_;
-
-      if (dt <= 0.0) {
-        RCLCPP_DEBUG_STREAM(this->get_logger(), "Ignored IMU data with dt <= 0 (dt = " << dt << ")");
-        return;
-      }
-
-      // 有効なデータの場合のみ、前回の時間を更新する
-      last_imu_time_ = current_time;
-
-      gtsam::Vector3 acc(msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z);
-      gtsam::Vector3 gyro(msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z);
-
-      imu_preintegrated_->integrateMeasurement(acc, gyro, dt);
+      imu_buffer_.push_back(msg);
     }
 
     void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
       std::lock_guard<std::mutex> lock(mtx_);
+
+      // Odomの時刻を取得
+      double current_odom_time = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
 
       gtsam::Pose3 current_pose = gtsam::Pose3(gtsam::Rot3::Quaternion(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
                                                                        msg->pose.pose.orientation.y, msg->pose.pose.orientation.z),
                                                gtsam::Point3(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z));
 
       if (keyframe_id_ == 0) {
+        // 初期化時にOdomより古いIMUデータを破棄し、初期時刻を合わせる
+        if (use_imu_) {
+          while (!imu_buffer_.empty()) {
+            double imu_time = imu_buffer_.front()->header.stamp.sec + imu_buffer_.front()->header.stamp.nanosec * 1e-9;
+            if (imu_time <= current_odom_time) {
+              last_imu_time_ = imu_time;
+              imu_buffer_.pop_front();
+            } else {
+              break;
+            }
+          }
+          if (last_imu_time_ < 0) {
+            last_imu_time_ = current_odom_time;
+          }
+        }
+
         // 初期ノードの Prior 登録
         gtSAMgraph_.add(gtsam::PriorFactor<gtsam::Pose3>(X(0), current_pose, prior_noise_));
         initialEstimate_.insert(X(0), current_pose);
@@ -172,11 +179,48 @@ namespace simple_slam {
           gtSAMgraph_.add(gtsam::PriorFactor<gtsam::imuBias::ConstantBias>(B(0), prev_bias_, prior_bias_noise_));
           initialEstimate_.insert(V(0), prev_velocity_);
           initialEstimate_.insert(B(0), prev_bias_);
+          imu_preintegrated_->resetIntegrationAndSetBias(prev_bias_);
         }
       } else {
-        // LiDAR Odometry Factor (BetweenFactor)
+        // 現在のOdom時刻までのIMUデータをバッファから取り出して積分する
+        if (use_imu_) {
+          while (!imu_buffer_.empty()) {
+            auto imu_msg    = imu_buffer_.front();
+            double imu_time = imu_msg->header.stamp.sec + imu_msg->header.stamp.nanosec * 1e-9;
+
+            // Odomの時刻より未来のデータは次回の積分に回すため抜ける
+            if (imu_time > current_odom_time) {
+              break;
+            }
+
+            double dt = imu_time - last_imu_time_;
+            if (dt > 0.0) {
+              gtsam::Vector3 acc(imu_msg->linear_acceleration.x, imu_msg->linear_acceleration.y, imu_msg->linear_acceleration.z);
+              gtsam::Vector3 gyro(imu_msg->angular_velocity.x, imu_msg->angular_velocity.y, imu_msg->angular_velocity.z);
+
+              imu_preintegrated_->integrateMeasurement(acc, gyro, dt);
+              last_imu_time_ = imu_time;
+            } else if (dt < 0.0) {
+              RCLCPP_DEBUG_STREAM(this->get_logger(), "Ignored out-of-order IMU data (dt = " << dt << ")");
+            }
+
+            // 処理済みのメッセージを捨てる
+            imu_buffer_.pop_front();
+          }
+
+          // 有効なIMUデータが積分されていなければスキップしてクラッシュを防ぐ
+          if (imu_preintegrated_->deltaTij() <= 1e-4) {
+            RCLCPP_WARN(this->get_logger(), "No IMU data integrated between keyframes (dt = %f). Waiting for IMU...", imu_preintegrated_->deltaTij());
+            return;
+          }
+        }
+
+        // LiDAR Odometry Factor (BetweenFactor) は生の相対移動量を使用
         gtsam::Pose3 relative_pose = last_pose_.between(current_pose);
         gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(X(keyframe_id_ - 1), X(keyframe_id_), relative_pose, odom_noise_));
+
+        // ループクロージャ等で補正された最新の最適化済みポーズを取得
+        gtsam::Pose3 optimized_prev_pose = currentEstimate_.at<gtsam::Pose3>(X(keyframe_id_ - 1));
 
         if (use_imu_) {
           // IMU Factor の追加
@@ -188,16 +232,17 @@ namespace simple_slam {
           gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>(B(keyframe_id_ - 1), B(keyframe_id_), gtsam::imuBias::ConstantBias(),
                                                                              bias_rw_noise_));
 
-          // IMUを用いた予測値で初期推定
-          gtsam::NavState prev_state(last_pose_, prev_velocity_);
+          // 予測の起点を最適化済みポーズに変更し、線形化エラーを防ぐ
+          gtsam::NavState prev_state(optimized_prev_pose, prev_velocity_);
           gtsam::NavState prop_state = imu_preintegrated_->predict(prev_state, prev_bias_);
 
-          initialEstimate_.insert(X(keyframe_id_), current_pose);
+          initialEstimate_.insert(X(keyframe_id_), prop_state.pose());
           initialEstimate_.insert(V(keyframe_id_), prop_state.velocity());
           initialEstimate_.insert(B(keyframe_id_), prev_bias_);
         } else {
-          // IMUを使わない場合はLiDARの結果だけをそのまま挿入
-          initialEstimate_.insert(X(keyframe_id_), current_pose);
+          // IMUを使わない場合も、最適化済みポーズに相対移動を掛け合わせたものを初期値にする
+          gtsam::Pose3 initial_guess_pose = optimized_prev_pose * relative_pose;
+          initialEstimate_.insert(X(keyframe_id_), initial_guess_pose);
         }
       }
 
