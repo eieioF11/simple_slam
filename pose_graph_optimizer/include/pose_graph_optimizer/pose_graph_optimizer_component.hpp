@@ -32,6 +32,7 @@
 #include <spdlog/spdlog.h>
 
 #include <deque>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -50,24 +51,21 @@ namespace simple_slam {
       if (use_imu_) {
         RCLCPP_INFO(this->get_logger(), "Starting GTSAM Pose Graph Optimizer WITH IMU (Tightly-coupled)...");
       } else {
-        RCLCPP_INFO(this->get_logger(), "Starting GTSAM Pose Graph Optimizer WITHOUT IMU (LiDAR Odometry Only)...");
+        RCLCPP_INFO(this->get_logger(), "Starting GTSAM Pose Graph Optimizer WITHOUT IMU (LiOdometry Only)...");
       }
 
       logger_ = spdlog::get("pose_graph_optimizer_logger");
 
-      // ISAM2のパラメータ設定
       gtsam::ISAM2Params parameters;
       parameters.relinearizeThreshold = param<double>("pose_graph_optimizer.isam2.relinearizeThreshold", 0.1);
       parameters.relinearizeSkip      = param<int>("pose_graph_optimizer.isam2.relinearizeSkip", 1);
       ISAM2_UPDATE_NUM                = param<int>("pose_graph_optimizer.isam2.update_num", 3);
       isam2_                          = std::make_unique<gtsam::ISAM2>(parameters);
 
-      // ノイズモデルの定義
       prior_noise_ = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
       odom_noise_  = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1e-2, 1e-2, 1e-2, 1e-3, 1e-3, 1e-3).finished());
 
-      // ループクロージャのノイズモデルにロバストカーネル（Huber関数）を適用し、外れ値への耐性を高める
-      auto base_loop_noise = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 5e-2, 5e-2, 5e-2, 1e-2, 1e-2, 1e-2).finished());
+      auto base_loop_noise = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1e-1, 1e-1, 1e-1, 5e-2, 5e-2, 5e-2).finished());
       auto huber           = gtsam::noiseModel::mEstimator::Huber::Create(1.0);
       loop_noise_          = gtsam::noiseModel::Robust::Create(huber, base_loop_noise);
 
@@ -88,14 +86,12 @@ namespace simple_slam {
                                                                     std::bind(&PoseGraphOptimizer::imuCallback, this, std::placeholders::_1));
       }
 
-      // Subscribers
       odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>("scan_matcher/keyframe_odom", rclcpp::QoS(10),
                                                                      std::bind(&PoseGraphOptimizer::odomCallback, this, std::placeholders::_1));
 
       loop_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
           "loop_closure/constraint", rclcpp::QoS(10), std::bind(&PoseGraphOptimizer::loopClosureCallback, this, std::placeholders::_1));
 
-      // Publishers
       path_pub_  = this->create_publisher<nav_msgs::msg::Path>("optimized_path", rclcpp::QoS(1));
       graph_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("factor_graph_markers", rclcpp::QoS(1));
     }
@@ -110,19 +106,18 @@ namespace simple_slam {
     std::shared_ptr<spdlog::logger> logger_;
 
     std::mutex mtx_;
-    int keyframe_id_ = 0;
 
-    // 状態管理
+    // ★ 前回の有効なマスターIDを記録
+    int last_kf_id_ = -1;
+
     gtsam::Pose3 last_pose_;
     gtsam::Vector3 prev_velocity_ = gtsam::Vector3::Zero();
     gtsam::imuBias::ConstantBias prev_bias_;
     std::shared_ptr<gtsam::PreintegratedImuMeasurements> imu_preintegrated_;
     double last_imu_time_ = -1.0;
 
-    // IMUデータを一時保存するバッファ
     std::deque<sensor_msgs::msg::Imu::SharedPtr> imu_buffer_;
 
-    // Noise Models
     gtsam::noiseModel::Diagonal::shared_ptr prior_noise_;
     gtsam::noiseModel::Diagonal::shared_ptr odom_noise_;
     gtsam::noiseModel::Base::shared_ptr loop_noise_;
@@ -138,7 +133,6 @@ namespace simple_slam {
 
     void imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg) {
       if (!use_imu_) return;
-
       std::lock_guard<std::mutex> lock(mtx_);
       imu_buffer_.push_back(msg);
     }
@@ -146,15 +140,21 @@ namespace simple_slam {
     void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
       std::lock_guard<std::mutex> lock(mtx_);
 
-      // Odomの時刻を取得
+      // メッセージからマスターIDを抽出
+      int kf_id = -1;
+      try {
+        kf_id = std::stoi(msg->child_frame_id);
+      } catch (const std::exception& e) {
+        return; // 無効なIDは無視
+      }
+
       double current_odom_time = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
 
       gtsam::Pose3 current_pose = gtsam::Pose3(gtsam::Rot3::Quaternion(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
                                                                        msg->pose.pose.orientation.y, msg->pose.pose.orientation.z),
                                                gtsam::Point3(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z));
 
-      if (keyframe_id_ == 0) {
-        // 初期化時にOdomより古いIMUデータを破棄し、初期時刻を合わせる
+      if (last_kf_id_ == -1) {
         if (use_imu_) {
           while (!imu_buffer_.empty()) {
             double imu_time = imu_buffer_.front()->header.stamp.sec + imu_buffer_.front()->header.stamp.nanosec * 1e-9;
@@ -170,25 +170,22 @@ namespace simple_slam {
           }
         }
 
-        // 初期ノードの Prior 登録
-        gtSAMgraph_.add(gtsam::PriorFactor<gtsam::Pose3>(X(0), current_pose, prior_noise_));
-        initialEstimate_.insert(X(0), current_pose);
+        gtSAMgraph_.add(gtsam::PriorFactor<gtsam::Pose3>(X(kf_id), current_pose, prior_noise_));
+        initialEstimate_.insert(X(kf_id), current_pose);
 
         if (use_imu_) {
-          gtSAMgraph_.add(gtsam::PriorFactor<gtsam::Vector3>(V(0), prev_velocity_, prior_vel_noise_));
-          gtSAMgraph_.add(gtsam::PriorFactor<gtsam::imuBias::ConstantBias>(B(0), prev_bias_, prior_bias_noise_));
-          initialEstimate_.insert(V(0), prev_velocity_);
-          initialEstimate_.insert(B(0), prev_bias_);
+          gtSAMgraph_.add(gtsam::PriorFactor<gtsam::Vector3>(V(kf_id), prev_velocity_, prior_vel_noise_));
+          gtSAMgraph_.add(gtsam::PriorFactor<gtsam::imuBias::ConstantBias>(B(kf_id), prev_bias_, prior_bias_noise_));
+          initialEstimate_.insert(V(kf_id), prev_velocity_);
+          initialEstimate_.insert(B(kf_id), prev_bias_);
           imu_preintegrated_->resetIntegrationAndSetBias(prev_bias_);
         }
       } else {
-        // 現在のOdom時刻までのIMUデータをバッファから取り出して積分する
         if (use_imu_) {
           while (!imu_buffer_.empty()) {
             auto imu_msg    = imu_buffer_.front();
             double imu_time = imu_msg->header.stamp.sec + imu_msg->header.stamp.nanosec * 1e-9;
 
-            // Odomの時刻より未来のデータは次回の積分に回すため抜ける
             if (imu_time > current_odom_time) {
               break;
             }
@@ -200,53 +197,43 @@ namespace simple_slam {
 
               imu_preintegrated_->integrateMeasurement(acc, gyro, dt);
               last_imu_time_ = imu_time;
-            } else if (dt < 0.0) {
-              RCLCPP_DEBUG_STREAM(this->get_logger(), "Ignored out-of-order IMU data (dt = " << dt << ")");
             }
-
-            // 処理済みのメッセージを捨てる
             imu_buffer_.pop_front();
           }
 
-          // 有効なIMUデータが積分されていなければスキップしてクラッシュを防ぐ
           if (imu_preintegrated_->deltaTij() <= 1e-4) {
             RCLCPP_WARN(this->get_logger(), "No IMU data integrated between keyframes (dt = %f). Waiting for IMU...", imu_preintegrated_->deltaTij());
             return;
           }
         }
 
-        // LiDAR Odometry Factor (BetweenFactor) は生の相対移動量を使用
+        // 前回のキーフレームから現在のキーフレームへの制約を結ぶ
         gtsam::Pose3 relative_pose = last_pose_.between(current_pose);
-        gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(X(keyframe_id_ - 1), X(keyframe_id_), relative_pose, odom_noise_));
+        gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::Pose3>(X(last_kf_id_), X(kf_id), relative_pose, odom_noise_));
 
-        // ループクロージャ等で補正された最新の最適化済みポーズを取得
-        gtsam::Pose3 optimized_prev_pose = currentEstimate_.at<gtsam::Pose3>(X(keyframe_id_ - 1));
+        gtsam::Pose3 optimized_prev_pose = currentEstimate_.at<gtsam::Pose3>(X(last_kf_id_));
 
         if (use_imu_) {
-          // IMU Factor の追加
-          gtsam::ImuFactor imu_factor(X(keyframe_id_ - 1), V(keyframe_id_ - 1), X(keyframe_id_), V(keyframe_id_), B(keyframe_id_ - 1),
-                                      *imu_preintegrated_);
+          gtsam::ImuFactor imu_factor(X(last_kf_id_), V(last_kf_id_), X(kf_id), V(kf_id), B(last_kf_id_), *imu_preintegrated_);
           gtSAMgraph_.add(imu_factor);
 
-          // IMUバイアス変化のランダムウォーク制約
-          gtSAMgraph_.add(gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>(B(keyframe_id_ - 1), B(keyframe_id_), gtsam::imuBias::ConstantBias(),
-                                                                             bias_rw_noise_));
+          gtSAMgraph_.add(
+              gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>(B(last_kf_id_), B(kf_id), gtsam::imuBias::ConstantBias(), bias_rw_noise_));
 
-          // 予測の起点を最適化済みポーズに変更し、線形化エラーを防ぐ
           gtsam::NavState prev_state(optimized_prev_pose, prev_velocity_);
           gtsam::NavState prop_state = imu_preintegrated_->predict(prev_state, prev_bias_);
 
-          initialEstimate_.insert(X(keyframe_id_), prop_state.pose());
-          initialEstimate_.insert(V(keyframe_id_), prop_state.velocity());
-          initialEstimate_.insert(B(keyframe_id_), prev_bias_);
+          initialEstimate_.insert(X(kf_id), prop_state.pose());
+          initialEstimate_.insert(V(kf_id), prop_state.velocity());
+          initialEstimate_.insert(B(kf_id), prev_bias_);
         } else {
-          // IMUを使わない場合も、最適化済みポーズに相対移動を掛け合わせたものを初期値にする
           gtsam::Pose3 initial_guess_pose = optimized_prev_pose * relative_pose;
-          initialEstimate_.insert(X(keyframe_id_), initial_guess_pose);
+          initialEstimate_.insert(X(kf_id), initial_guess_pose);
         }
       }
 
-      last_pose_ = current_pose;
+      last_kf_id_ = kf_id;
+      last_pose_  = current_pose;
 
       isam2_->update(gtSAMgraph_, initialEstimate_);
       for (int i = 0; i < ISAM2_UPDATE_NUM; ++i)
@@ -257,24 +244,33 @@ namespace simple_slam {
 
       currentEstimate_ = isam2_->calculateEstimate();
 
-      // IMU使用時のみ、バイアスと速度の更新処理を行う
       if (use_imu_) {
-        prev_velocity_ = currentEstimate_.at<gtsam::Vector3>(V(keyframe_id_));
-        prev_bias_     = currentEstimate_.at<gtsam::imuBias::ConstantBias>(B(keyframe_id_));
+        prev_velocity_ = currentEstimate_.at<gtsam::Vector3>(V(kf_id));
+        prev_bias_     = currentEstimate_.at<gtsam::imuBias::ConstantBias>(B(kf_id));
         imu_preintegrated_->resetIntegrationAndSetBias(prev_bias_);
       }
-
-      keyframe_id_++;
 
       publishOptimizedPath(msg->header.stamp);
     }
 
     void loopClosureCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
       std::lock_guard<std::mutex> lock(mtx_);
-      int loop_target_id = std::stoi(msg->header.frame_id);
-      int current_id     = keyframe_id_ - 1;
+      int loop_target_id = -1;
+      int current_id     = -1;
+      try {
+        loop_target_id = std::stoi(msg->header.frame_id);
+        current_id     = std::stoi(msg->child_frame_id);
+      } catch (const std::exception& e) {
+        return;
+      }
 
       if (loop_target_id >= current_id) return;
+
+      // 受信した制約の両端がGTSAM内に実在するかチェック (非同期・欠損対策)
+      if (!currentEstimate_.exists(X(current_id)) || !currentEstimate_.exists(X(loop_target_id))) {
+        RCLCPP_WARN(this->get_logger(), "Loop closure node not found in graph. Ignored.");
+        return;
+      }
 
       gtsam::Pose3 loop_relative_pose = gtsam::Pose3(gtsam::Rot3::Quaternion(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
                                                                              msg->pose.pose.orientation.y, msg->pose.pose.orientation.z),
@@ -300,24 +296,33 @@ namespace simple_slam {
       path_msg.header.stamp    = stamp;
       path_msg.header.frame_id = "map";
 
-      for (int i = 0; i < keyframe_id_; ++i) {
-        if (currentEstimate_.exists(X(i))) {
-          gtsam::Pose3 pose = currentEstimate_.at<gtsam::Pose3>(X(i));
-          geometry_msgs::msg::PoseStamped pose_stamped;
-          pose_stamped.header = path_msg.header;
-
-          pose_stamped.pose.position.x = pose.x();
-          pose_stamped.pose.position.y = pose.y();
-          pose_stamped.pose.position.z = pose.z();
-
-          auto q                          = pose.rotation().toQuaternion();
-          pose_stamped.pose.orientation.w = q.w();
-          pose_stamped.pose.orientation.x = q.x();
-          pose_stamped.pose.orientation.y = q.y();
-          pose_stamped.pose.orientation.z = q.z();
-
-          path_msg.poses.push_back(pose_stamped);
+      // GTSAMに保存されているキーをID順にソートして抽出
+      std::map<int, gtsam::Pose3> sorted_poses;
+      for (const auto& key_value : currentEstimate_) {
+        gtsam::Symbol sym(key_value.key);
+        if (sym.chr() == 'x') {
+          sorted_poses[sym.index()] = currentEstimate_.at<gtsam::Pose3>(sym);
         }
+      }
+
+      for (const auto& [id, pose] : sorted_poses) {
+        geometry_msgs::msg::PoseStamped pose_stamped;
+        pose_stamped.header = path_msg.header;
+
+        // ★ 各ポーズに対応するマスターIDを付与する
+        pose_stamped.header.frame_id = std::to_string(id);
+
+        pose_stamped.pose.position.x = pose.x();
+        pose_stamped.pose.position.y = pose.y();
+        pose_stamped.pose.position.z = pose.z();
+
+        auto q                          = pose.rotation().toQuaternion();
+        pose_stamped.pose.orientation.w = q.w();
+        pose_stamped.pose.orientation.x = q.x();
+        pose_stamped.pose.orientation.y = q.y();
+        pose_stamped.pose.orientation.z = q.z();
+
+        path_msg.poses.push_back(pose_stamped);
       }
       path_pub_->publish(path_msg);
     }

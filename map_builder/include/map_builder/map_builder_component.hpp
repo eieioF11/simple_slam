@@ -33,6 +33,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -85,10 +86,11 @@ namespace simple_slam {
 
     std::mutex mtx_;
 
-    std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> keyframe_clouds_;
-    std::vector<Eigen::Matrix4d> keyframe_raw_poses_;
-    pcl::PointCloud<pcl::PointXYZ>::Ptr latest_global_cloud_{new pcl::PointCloud<pcl::PointXYZ>()};
+    // ★ 配列のズレを防ぐため、マスターIDをキーとする std::map に変更
+    std::map<int, pcl::PointCloud<pcl::PointXYZ>::Ptr> keyframe_clouds_;
+    std::map<int, Eigen::Matrix4d> keyframe_raw_poses_;
 
+    pcl::PointCloud<pcl::PointXYZ>::Ptr latest_global_cloud_{new pcl::PointCloud<pcl::PointXYZ>()};
     nav_msgs::msg::OccupancyGrid::SharedPtr latest_grid_map_;
 
     using SyncPolicy = message_filters::sync_policies::ExactTime<nav_msgs::msg::Odometry, sensor_msgs::msg::PointCloud2>;
@@ -201,6 +203,13 @@ namespace simple_slam {
     void keyframeCallback(const nav_msgs::msg::Odometry::ConstSharedPtr& odom_msg, const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud_msg) {
       std::lock_guard<std::mutex> lock(mtx_);
 
+      int kf_id = -1;
+      try {
+        kf_id = std::stoi(odom_msg->child_frame_id);
+      } catch (const std::exception& e) {
+        return; // 無効なIDの場合はスキップ
+      }
+
       Eigen::Matrix4d pose   = Eigen::Matrix4d::Identity();
       pose.block<3, 3>(0, 0) = Eigen::Quaterniond(odom_msg->pose.pose.orientation.w, odom_msg->pose.pose.orientation.x,
                                                   odom_msg->pose.pose.orientation.y, odom_msg->pose.pose.orientation.z)
@@ -218,8 +227,9 @@ namespace simple_slam {
       voxel_filter.setInputCloud(cloud);
       voxel_filter.filter(*downsampled_cloud);
 
-      keyframe_raw_poses_.push_back(pose);
-      keyframe_clouds_.push_back(downsampled_cloud);
+      // マスターIDに紐付けて保存
+      keyframe_raw_poses_[kf_id] = pose;
+      keyframe_clouds_[kf_id]    = downsampled_cloud;
     }
 
     void pathCallback(const nav_msgs::msg::Path::SharedPtr path_msg) {
@@ -230,14 +240,24 @@ namespace simple_slam {
       }
 
       pcl::PointCloud<pcl::PointXYZ>::Ptr global_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-      size_t num_frames = std::min(keyframe_clouds_.size(), path_msg->poses.size());
-
       std::vector<Eigen::Vector3d> frame_origins;
       std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> transformed_clouds;
 
-      for (size_t i = 0; i < num_frames; ++i) {
+      for (const auto& pose_stamped : path_msg->poses) {
+        int id = -1;
+        try {
+          id = std::stoi(pose_stamped.header.frame_id);
+        } catch (const std::exception& e) {
+          continue;
+        }
+
+        // 送られてきたIDに対応する点群が存在するか確認 (欠損時対策)
+        if (keyframe_clouds_.find(id) == keyframe_clouds_.end()) {
+          continue;
+        }
+
         Eigen::Matrix4d opt_pose   = Eigen::Matrix4d::Identity();
-        const auto& p              = path_msg->poses[i].pose;
+        const auto& p              = pose_stamped.pose;
         opt_pose.block<3, 3>(0, 0) = Eigen::Quaterniond(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z).toRotationMatrix();
         opt_pose(0, 3)             = p.position.x;
         opt_pose(1, 3)             = p.position.y;
@@ -246,10 +266,11 @@ namespace simple_slam {
         Eigen::Vector3d origin(p.position.x, p.position.y, p.position.z);
         frame_origins.push_back(origin);
 
-        Eigen::Matrix4d correction_transform = opt_pose * keyframe_raw_poses_[i].inverse();
+        // 必ず「自分の生ポーズ」を使って補正行列を計算する
+        Eigen::Matrix4d correction_transform = opt_pose * keyframe_raw_poses_[id].inverse();
 
         pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-        pcl::transformPointCloud(*keyframe_clouds_[i], *transformed_cloud, correction_transform);
+        pcl::transformPointCloud(*keyframe_clouds_[id], *transformed_cloud, correction_transform);
 
         transformed_clouds.push_back(transformed_cloud);
         *global_cloud += *transformed_cloud;
